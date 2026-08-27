@@ -145,13 +145,18 @@ vst/
       are more stable.
 
 ### Phase 1 — MIDI data model
-- [ ] Define a `Note` struct: pitch, velocity, start time, duration,
-      channel.
-- [ ] Define a `MidiClip` struct: a list of notes plus tempo and time
+- [x] Define a `Note` struct: pitch, velocity, start time, duration,
+      channel. See `crates/agent-core/src/midi.rs`.
+- [x] Define a `MidiClip` struct: a list of notes plus tempo and time
       signature.
-- [ ] Write functions to convert a `MidiClip` to a standard MIDI file, and
-      back, using `midly`.
-- [ ] Write unit tests for the conversion functions.
+- [x] Write functions to convert a `MidiClip` to a standard MIDI file, and
+      back, using `midly`. These are `MidiClip::to_smf_bytes` and
+      `MidiClip::from_smf_bytes`. They build a format 0 (single track)
+      file. Reading back merges notes from every track in a file, and
+      keeps the first tempo and time signature found.
+- [x] Write unit tests for the conversion functions. Tests cover: a
+      round trip of notes, a round trip of tempo and time signature, an
+      empty clip, and rejecting a note with an out-of-range pitch.
 
 ### Phase 2 — Plugin skeleton with fixed MIDI output
 - [ ] Build a CLAP/VST3 plugin that sends one fixed test note pattern to

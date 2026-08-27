@@ -1,7 +1,11 @@
 //! Core logic for the AI MIDI Agent plugin.
 //!
-//! This crate has no plugin code. Phase 0 only sets up the crate. Later
-//! phases add the MIDI data model and the AI provider clients here.
+//! This crate has no plugin code. It has the MIDI data model, in
+//! [`midi`]. Later phases add the AI provider clients here too.
+
+pub mod midi;
+
+pub use midi::{MidiClip, MidiError, Note, TimeSignature};
 
 pub fn placeholder() -> &'static str {
     "agent-core"

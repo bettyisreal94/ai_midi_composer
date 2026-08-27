@@ -35,7 +35,7 @@ vst/
 
 ## Quick start with `make`
 
-This project has a `Makefile` with ten standard steps. Read `Dockerfile` and `Makefile` for the exact commands. Every step is safe to run more than once.
+This project has a `Makefile` with eight of the ten standard steps. Read `Makefile` for the exact commands. Every step is safe to run more than once.
 
 | Step | What it does |
 | --- | --- |
