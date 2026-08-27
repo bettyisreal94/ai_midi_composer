@@ -16,16 +16,21 @@
 
 use agent_core::midi::MidiClip;
 
-/// The state shown by the "Generate" status label.
+/// The state shown by the status label next to "Generate" and "Vary
+/// current clip". Also used for "Load .mid...", since loading a file
+/// replaces the current clip the same way a generation result does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenerationStatus {
-    /// The user has not pressed "Generate" yet this session.
+    /// The user has not pressed "Generate", "Vary current clip", or
+    /// "Load .mid..." yet this session.
     Idle,
     /// A generation request is running.
     Working,
-    /// The last generation request finished, and produced a clip.
+    /// The last generation request, or file load, finished, and
+    /// produced a clip.
     Done,
-    /// The last generation request failed, or the user gave bad input.
+    /// The last generation request, or file load, failed, or the user
+    /// gave bad input.
     Error,
 }
 
@@ -99,8 +104,15 @@ impl Default for ProviderSettings {
 /// it happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiAction {
-    /// The user pressed "Generate".
+    /// The user pressed "Generate": create a new clip from `prompt`
+    /// alone.
     Generate,
+    /// The user pressed "Vary current clip": create a new clip from
+    /// the clip already loaded, plus `prompt` as the instruction for
+    /// how to change it.
+    GenerateVariation,
+    /// The user pressed "Load .mid...".
+    LoadMidFile,
     /// The user pressed "Save as .mid".
     Save,
     /// The user picked a different provider kind. `agent-plugin` should
@@ -160,9 +172,9 @@ pub fn draw(
     egui::CentralPanel::default().show(ctx, |ui| {
         ui.heading("AI MIDI Agent (dev)");
         ui.label(
-            "This is a Phase 4 skeleton. \"Generate\" still always makes the \
-             same fixed clip: the provider settings below are not wired to \
-             it yet. Phase 5 builds that connection.",
+            "\"Generate\" makes a new clip from the prompt below. \"Vary \
+             current clip\" changes the loaded clip by the prompt's \
+             instruction instead, such as \"add a harmony line\".",
         );
         ui.separator();
 
@@ -222,6 +234,11 @@ pub fn draw(
                 actions.push(UiAction::Generate);
             }
 
+            let vary_button = egui::Button::new("Vary current clip");
+            if ui.add_enabled(!generation_pending, vary_button).clicked() {
+                actions.push(UiAction::GenerateVariation);
+            }
+
             let (label, color) = match state.status {
                 GenerationStatus::Idle => ("idle".to_string(), egui::Color32::GRAY),
                 GenerationStatus::Working => ("working…".to_string(), egui::Color32::YELLOW),
@@ -253,12 +270,19 @@ pub fn draw(
 
         ui.separator();
         ui.label(
-            "There is no drag-and-drop out of this window yet. Use \
-             \"Save as .mid\" and drag the file into your DAW instead.",
+            "There is no drag-and-drop into or out of this window yet. \
+             Use \"Load .mid...\" to open a file, and \"Save as .mid\" \
+             then drag the saved file into your DAW.",
         );
-        if ui.button("Save as .mid...").clicked() {
-            actions.push(UiAction::Save);
-        }
+        ui.horizontal(|ui| {
+            let load_button = egui::Button::new("Load .mid...");
+            if ui.add_enabled(!generation_pending, load_button).clicked() {
+                actions.push(UiAction::LoadMidFile);
+            }
+            if ui.button("Save as .mid...").clicked() {
+                actions.push(UiAction::Save);
+            }
+        });
         match &state.save_message {
             Some(Ok(message)) => {
                 ui.colored_label(egui::Color32::GREEN, message);

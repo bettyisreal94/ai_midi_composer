@@ -500,11 +500,47 @@ prompt template and a JSON reply format, which do not exist yet.
     Phase 2 design, actually moves notes into a DAW.
 
 ### Phase 6 — MIDI import and variation
-- [ ] Add a file picker or drag-and-drop target for `.mid` files.
-- [ ] Read the file into a `MidiClip` with the Phase 1 code.
-- [ ] Add a prompt mode that sends the existing notes plus a text
+- [x] Add a file picker or drag-and-drop target for `.mid` files.
+  - Used a file picker only ("Load .mid..."), the same way "Save as
+    .mid" already does, with `rfd::FileDialog::new().pick_file()`.
+  - A drag-and-drop *target* (accepting a file dropped onto the
+    plugin window) is a different, and easier, problem than Phase
+    2's drag-*out* problem, since it only needs to receive an OS
+    event, not start a native drag session. It was still left out of
+    this phase: whether `nih_plug_egui`'s windowing backend
+    (`egui-baseview`) forwards a native file-drop event into egui's
+    `dropped_files` input at all is unconfirmed, and this project has
+    no way to test that without a real host. The file picker already
+    satisfies this item, since the plan said "a file picker **or**
+    drag-and-drop target".
+- [x] Read the file into a `MidiClip` with the Phase 1 code.
+  - See `load_clip_from_file()` in `crates/agent-plugin/src/lib.rs`.
+    It reads the chosen path's bytes, then calls
+    `MidiClip::from_smf_bytes()`.
+- [x] Add a prompt mode that sends the existing notes plus a text
       instruction, such as "add a harmony line" or "make a variation".
-- [ ] Return the new `MidiClip` and show it the same way as Phase 5.
+  - Added a second button, "Vary current clip", next to "Generate".
+    It sends the loaded clip's notes, as the same beats-based JSON
+    `parse_clip_reply` reads, plus the prompt box's text as the
+    instruction. See `agent_core::generate_variation()`.
+  - It reuses `generate_clip()`'s retry behavior directly, by building
+    a single, richer prompt string that embeds both the existing clip
+    and the instruction: the retry logic does not need to know the
+    difference between "generate something new" and "vary this clip".
+  - Rejects an invalid existing clip (one `MidiClip::validate()` would
+    reject) before ever contacting the provider, with a dedicated
+    `PipelineError::InvalidInput`, and rejects an empty instruction in
+    the editor before submitting a request at all, the same way the
+    Phase 3 stub once rejected an empty prompt.
+  - Both "Load .mid..." and "Vary current clip" run through the same
+    background request system Phase 3.5 and Phase 5 built
+    (`background::GenerationStore`), extended with an optional
+    existing clip on a request, rather than a separate system.
+- [x] Return the new `MidiClip` and show it the same way as Phase 5.
+  - A loaded file, and a variation result, both replace
+    `EditorState::clip` (for "Save as .mid" and display) and publish
+    to the audio thread through `clip_publisher` (for live playback),
+    exactly like a fresh "Generate" result does.
 
 ### Phase 7 — Packaging
 - [x] Write a build script that copies the compiled plugin into the
@@ -592,6 +628,18 @@ prompt template and a JSON reply format, which do not exist yet.
     needs no retry, a bad first reply gets exactly one retry, two bad
     replies in a row fail with both attempts described, and a
     provider-level error (not a bad reply) is not retried at all.
+- [x] Add unit tests for the "vary current clip" pipeline.
+  - Added in Phase 6, alongside `generate_variation()`.
+  - The scripted `AiProvider` test double from the tests above was
+    extended to also record every prompt it was sent, so a test can
+    confirm the existing clip's notes, and the instruction, both
+    actually reach the model.
+  - Tests cover: a clip serialized to JSON and read back by
+    `parse_clip_reply` round-trips its notes, the existing clip and
+    instruction both appear in the prompt sent to the provider, the
+    same retry behavior as `generate_clip()` applies, and an invalid
+    existing clip is rejected before the provider is ever contacted
+    (confirmed by asserting the scripted provider's call count is 0).
 - [x] Add unit tests for the real-time-safe clip handoff to the audio
       thread.
   - Not in the original plan; added in Phase 5, alongside the handoff
@@ -601,12 +649,14 @@ prompt template and a JSON reply format, which do not exist yet.
     numbers keep increasing across several publishes, and a cloned
     publisher handle shares the same buffer as the original.
 - [x] Add unit tests for the background request-ID bookkeeping.
-  - Not in the original plan; added in Phase 3.5, expanded in Phase 5.
-    See `crates/agent-plugin/src/background.rs`.
-  - Tests cover only the bookkeeping (assigning IDs, and a result
-    being delivered by `poll()` exactly once), not a real network
-    call: `run()`'s own behavior is already covered by
-    `agent_core::pipeline`'s and `agent_core::provider`'s tests.
+  - Not in the original plan; added in Phase 3.5, expanded in Phase 5
+    and Phase 6. See `crates/agent-plugin/src/background.rs`.
+  - Tests cover only the bookkeeping (assigning IDs, a result being
+    delivered by `poll()` exactly once, and a request correctly
+    recording an existing clip for a "vary current clip" request),
+    not a real network call: `run()`'s own behavior is already
+    covered by `agent_core::pipeline`'s and `agent_core::provider`'s
+    tests.
 - [ ] Add a manual test checklist. Run it before each release:
   - [ ] Plugin loads in a Linux host.
   - [ ] Plugin loads in a macOS host.

@@ -6,8 +6,12 @@
 //! network call without blocking the UI. This module gives them a
 //! ready seam: submit a prompt and the provider settings to use, get a
 //! request ID back, and poll for a result under that ID later. Phase 5
-//! plugs a real call to `agent_core::generate_clip` in here, replacing
-//! the Phase 3 stub.
+//! plugged a real call to `agent_core::generate_clip` in here, in
+//! place of the Phase 3 stub. Phase 6 added an optional existing clip
+//! to a request: when present, `run()` calls
+//! `agent_core::generate_variation` instead, to vary that clip by the
+//! prompt's instruction, rather than generating a new one from
+//! scratch.
 //!
 //! [`GenerateTask`], the type plugged into `Plugin::BackgroundTask`,
 //! carries only a request ID, not the prompt text. This keeps it cheap
@@ -64,10 +68,20 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn AiProvider> {
     }
 }
 
+/// A submitted, not yet run, request.
+#[derive(Clone)]
+struct PendingRequest {
+    prompt: String,
+    config: ProviderConfig,
+    /// `Some` for a "vary this clip" request (Phase 6); `None` for a
+    /// "generate something new" request.
+    existing_clip: Option<MidiClip>,
+}
+
 #[derive(Default)]
 struct Requests {
     next_id: RequestId,
-    pending: HashMap<RequestId, (String, ProviderConfig)>,
+    pending: HashMap<RequestId, PendingRequest>,
     results: HashMap<RequestId, Result<MidiClip, String>>,
 }
 
@@ -87,22 +101,37 @@ struct Requests {
 pub struct GenerationStore(Arc<Mutex<Requests>>);
 
 impl GenerationStore {
-    /// Records a new prompt and the provider settings to use for it,
-    /// and returns the request ID for it.
-    pub fn submit(&self, prompt: String, config: ProviderConfig) -> RequestId {
+    /// Records a new request, and returns the request ID for it.
+    /// `existing_clip` is `Some` for a "vary this clip" request, where
+    /// `prompt` is the instruction to vary it by, or `None` for a
+    /// "generate something new" request, where `prompt` is the whole
+    /// request.
+    pub fn submit(
+        &self,
+        prompt: String,
+        config: ProviderConfig,
+        existing_clip: Option<MidiClip>,
+    ) -> RequestId {
         let mut requests = self.0.lock().unwrap();
         let id = requests.next_id;
         requests.next_id += 1;
-        requests.pending.insert(id, (prompt, config));
+        requests.pending.insert(
+            id,
+            PendingRequest {
+                prompt,
+                config,
+                existing_clip,
+            },
+        );
         id
     }
 
-    /// Runs the real prompt-to-MIDI pipeline for `id`'s prompt, and
+    /// Runs the real prompt-to-MIDI pipeline for `id`'s request, and
     /// stores the result. Call this from the background task executor,
     /// not from the UI or audio thread: it makes a blocking HTTP call.
     /// Does nothing if `id` is unknown.
     pub fn run(&self, id: RequestId) {
-        let (prompt, config) = {
+        let request = {
             let requests = self.0.lock().unwrap();
             match requests.pending.get(&id) {
                 Some(entry) => entry.clone(),
@@ -110,9 +139,14 @@ impl GenerationStore {
             }
         };
 
-        let provider = build_provider(&config);
-        let result =
-            agent_core::generate_clip(provider.as_ref(), &prompt).map_err(|err| err.to_string());
+        let provider = build_provider(&request.config);
+        let result = match &request.existing_clip {
+            Some(existing_clip) => {
+                agent_core::generate_variation(provider.as_ref(), existing_clip, &request.prompt)
+            }
+            None => agent_core::generate_clip(provider.as_ref(), &request.prompt),
+        }
+        .map_err(|err| err.to_string());
 
         let mut requests = self.0.lock().unwrap();
         requests.pending.remove(&id);
@@ -141,15 +175,15 @@ mod tests {
     #[test]
     fn submit_assigns_a_different_id_to_each_request() {
         let store = GenerationStore::default();
-        let first = store.submit("a".to_string(), config());
-        let second = store.submit("b".to_string(), config());
+        let first = store.submit("a".to_string(), config(), None);
+        let second = store.submit("b".to_string(), config(), None);
         assert_ne!(first, second);
     }
 
     #[test]
     fn poll_returns_none_before_a_result_exists() {
         let store = GenerationStore::default();
-        let id = store.submit("a".to_string(), config());
+        let id = store.submit("a".to_string(), config(), None);
         assert!(store.poll(id).is_none());
     }
 
@@ -159,7 +193,7 @@ mod tests {
         // does not need a real network call: `run()`'s own behavior is
         // covered by `agent_core::pipeline`'s tests instead.
         let store = GenerationStore::default();
-        let id = store.submit("a".to_string(), config());
+        let id = store.submit("a".to_string(), config(), None);
         store
             .0
             .lock()
@@ -179,5 +213,33 @@ mod tests {
         let store = GenerationStore::default();
         store.run(999);
         assert!(store.poll(999).is_none());
+    }
+
+    #[test]
+    fn submit_records_an_existing_clip_for_a_variation_request() {
+        use agent_core::midi::{MidiClip, Note, TimeSignature};
+
+        let store = GenerationStore::default();
+        let clip = MidiClip {
+            ticks_per_quarter: 960,
+            tempo_bpm: 120.0,
+            time_signature: TimeSignature::default(),
+            notes: vec![Note {
+                pitch: 60,
+                velocity: 100,
+                start: 0,
+                duration: 480,
+                channel: 0,
+            }],
+        };
+        let id = store.submit("add a harmony line".to_string(), config(), Some(clip));
+
+        let requests = store.0.lock().unwrap();
+        let pending = requests
+            .pending
+            .get(&id)
+            .expect("request should be pending");
+        assert!(pending.existing_clip.is_some());
+        assert_eq!(pending.prompt, "add a harmony line");
     }
 }

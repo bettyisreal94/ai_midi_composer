@@ -9,7 +9,7 @@ pub mod pipeline;
 pub mod provider;
 
 pub use midi::{MidiClip, MidiError, Note, TimeSignature};
-pub use pipeline::{generate_clip, parse_clip_reply, PipelineError};
+pub use pipeline::{generate_clip, generate_variation, parse_clip_reply, PipelineError};
 pub use provider::{AiProvider, AnthropicProvider, OpenAiCompatibleProvider, ProviderError};
 
 pub fn placeholder() -> &'static str {

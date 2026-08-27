@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::midi::{MidiClip, Note, TimeSignature, DEFAULT_TICKS_PER_QUARTER};
 use crate::provider::{AiProvider, ProviderError};
@@ -58,6 +58,11 @@ pub enum PipelineError {
     /// The reply's content could not be turned into a `MidiClip`, even
     /// after one retry. Holds a message describing both attempts.
     BadReply(String),
+    /// [`generate_variation`] was given a clip that is not itself
+    /// valid, or that could not be described as JSON. Asking a model
+    /// to vary a clip that does not make sense would not be
+    /// meaningful.
+    InvalidInput(String),
 }
 
 impl fmt::Display for PipelineError {
@@ -65,6 +70,7 @@ impl fmt::Display for PipelineError {
         match self {
             PipelineError::Provider(err) => write!(f, "{err}"),
             PipelineError::BadReply(message) => write!(f, "{message}"),
+            PipelineError::InvalidInput(message) => write!(f, "{message}"),
         }
     }
 }
@@ -77,7 +83,7 @@ impl From<ProviderError> for PipelineError {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct RawClip {
     tempo_bpm: f64,
     #[serde(default = "default_numerator")]
@@ -95,7 +101,7 @@ fn default_denominator() -> u8 {
     4
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct RawNote {
     pitch: u8,
     velocity: u8,
@@ -103,6 +109,30 @@ struct RawNote {
     duration_beats: f64,
     #[serde(default)]
     channel: u8,
+}
+
+/// Describes `clip` in the same beats-based JSON shape
+/// [`parse_clip_reply`] reads, so it can be shown back to a model, for
+/// example inside [`generate_variation`]'s prompt.
+fn clip_to_beats_json(clip: &MidiClip) -> Result<String, serde_json::Error> {
+    let ticks_per_quarter = clip.ticks_per_quarter as f64;
+    let raw = RawClip {
+        tempo_bpm: clip.tempo_bpm,
+        time_signature_numerator: clip.time_signature.numerator,
+        time_signature_denominator: clip.time_signature.denominator,
+        notes: clip
+            .notes
+            .iter()
+            .map(|note| RawNote {
+                pitch: note.pitch,
+                velocity: note.velocity,
+                start_beat: note.start as f64 / ticks_per_quarter,
+                duration_beats: note.duration as f64 / ticks_per_quarter,
+                channel: note.channel,
+            })
+            .collect(),
+    };
+    serde_json::to_string_pretty(&raw)
 }
 
 /// Pulls the JSON object out of a reply, tolerating the small
@@ -217,6 +247,44 @@ pub fn generate_clip(
     })
 }
 
+/// Turns `existing_clip` plus `instruction` into a new `MidiClip`, such
+/// as "add a harmony line" or "make a variation". Describes
+/// `existing_clip` to the model as JSON, in the same shape a reply
+/// must use, so the model can read it back directly.
+///
+/// This reuses [`generate_clip`]'s retry behavior: the "prompt" that
+/// function sees is the existing clip plus the instruction, combined
+/// into one piece of text. The rest of the pipeline, including the
+/// JSON reply format, does not need to know the difference between
+/// "generate something new" and "vary this clip".
+///
+/// Fails with [`PipelineError::InvalidInput`] if `existing_clip` is not
+/// itself valid (see [`MidiClip::validate`]): asking a model to vary a
+/// clip this project would reject on export would not be meaningful.
+pub fn generate_variation(
+    provider: &dyn AiProvider,
+    existing_clip: &MidiClip,
+    instruction: &str,
+) -> Result<MidiClip, PipelineError> {
+    existing_clip.validate().map_err(|err| {
+        PipelineError::InvalidInput(format!("the existing clip is not valid: {err}"))
+    })?;
+
+    let existing_json = clip_to_beats_json(existing_clip).map_err(|err| {
+        PipelineError::InvalidInput(format!("could not describe the existing clip: {err}"))
+    })?;
+
+    let user_prompt = format!(
+        "Here is an existing clip, as JSON, in the same format you must \
+         reply in:\n{existing_json}\n\nInstruction: {instruction}\n\n\
+         Reply with the whole new clip, not just the changed notes, in \
+         the same JSON format. You may keep, change, add, or remove \
+         notes, to follow the instruction."
+    );
+
+    generate_clip(provider, &user_prompt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +350,7 @@ mod tests {
     struct ScriptedProvider {
         replies: RefCell<Vec<Result<String, ProviderError>>>,
         call_count: RefCell<u32>,
+        prompts_seen: RefCell<Vec<String>>,
     }
 
     impl ScriptedProvider {
@@ -289,17 +358,27 @@ mod tests {
             Self {
                 replies: RefCell::new(replies),
                 call_count: RefCell::new(0),
+                prompts_seen: RefCell::new(Vec::new()),
             }
         }
 
         fn call_count(&self) -> u32 {
             *self.call_count.borrow()
         }
+
+        fn last_prompt(&self) -> String {
+            self.prompts_seen
+                .borrow()
+                .last()
+                .cloned()
+                .expect("complete() should have been called at least once")
+        }
     }
 
     impl AiProvider for ScriptedProvider {
-        fn complete(&self, _prompt: &str) -> Result<String, ProviderError> {
+        fn complete(&self, prompt: &str) -> Result<String, ProviderError> {
             *self.call_count.borrow_mut() += 1;
+            self.prompts_seen.borrow_mut().push(prompt.to_string());
             self.replies.borrow_mut().remove(0)
         }
     }
@@ -351,6 +430,71 @@ mod tests {
             provider.call_count(),
             1,
             "a provider error must not consume the retry attempt"
+        );
+    }
+
+    fn existing_clip() -> MidiClip {
+        MidiClip {
+            ticks_per_quarter: DEFAULT_TICKS_PER_QUARTER,
+            tempo_bpm: 90.0,
+            time_signature: TimeSignature::default(),
+            notes: vec![Note {
+                pitch: 60,
+                velocity: 100,
+                start: 0,
+                duration: DEFAULT_TICKS_PER_QUARTER as u32,
+                channel: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn clip_to_beats_json_then_parse_clip_reply_round_trips_notes() {
+        let clip = existing_clip();
+        let json = clip_to_beats_json(&clip).expect("should serialize");
+        let round_tripped = parse_clip_reply(&json).expect("should parse its own output");
+        assert_eq!(round_tripped.notes, clip.notes);
+        assert_eq!(round_tripped.tempo_bpm, clip.tempo_bpm);
+    }
+
+    #[test]
+    fn generate_variation_embeds_the_existing_clip_and_the_instruction() {
+        let provider = ScriptedProvider::new(vec![Ok(VALID_REPLY.to_string())]);
+        generate_variation(&provider, &existing_clip(), "add a harmony line")
+            .expect("should succeed");
+
+        let prompt = provider.last_prompt();
+        assert!(prompt.contains("add a harmony line"));
+        // The existing clip's one note, pitch 60, must show up in the
+        // JSON embedded in the prompt.
+        assert!(prompt.contains("\"pitch\": 60"));
+    }
+
+    #[test]
+    fn generate_variation_retries_the_same_way_generate_clip_does() {
+        let provider = ScriptedProvider::new(vec![
+            Ok("not json at all".to_string()),
+            Ok(VALID_REPLY.to_string()),
+        ]);
+        let clip = generate_variation(&provider, &existing_clip(), "make a variation")
+            .expect("retry should succeed");
+        assert_eq!(clip.notes.len(), 2);
+        assert_eq!(provider.call_count(), 2);
+    }
+
+    #[test]
+    fn generate_variation_rejects_an_invalid_existing_clip() {
+        let mut invalid_clip = existing_clip();
+        invalid_clip.notes[0].duration = 0; // MidiClip::validate() rejects this
+        let provider = ScriptedProvider::new(vec![Ok(VALID_REPLY.to_string())]);
+
+        let err = generate_variation(&provider, &invalid_clip, "add a harmony line")
+            .expect_err("an invalid existing clip should be rejected");
+        assert!(matches!(err, PipelineError::InvalidInput(_)));
+        assert_eq!(
+            provider.call_count(),
+            0,
+            "an invalid existing clip should not reach the provider at all"
         );
     }
 }

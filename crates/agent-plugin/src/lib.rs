@@ -233,13 +233,50 @@ impl Plugin for AgentPlugin {
                             // happened.
                             if state.pending_request_id.is_none() {
                                 let config = ProviderConfig::from(&state.ui.settings);
-                                let id = generation_store.submit(state.ui.prompt.clone(), config);
+                                let id =
+                                    generation_store.submit(state.ui.prompt.clone(), config, None);
                                 state.pending_request_id = Some(id);
                                 state.ui.status = agent_ui::GenerationStatus::Working;
                                 state.ui.status_message.clear();
                                 async_executor.execute_background(GenerateTask(id));
                             }
                         }
+                        agent_ui::UiAction::GenerateVariation => {
+                            if state.pending_request_id.is_none() {
+                                if state.ui.prompt.trim().is_empty() {
+                                    state.ui.status_message =
+                                        "Type an instruction first.".to_string();
+                                    state.ui.status = agent_ui::GenerationStatus::Error;
+                                } else {
+                                    let config = ProviderConfig::from(&state.ui.settings);
+                                    let id = generation_store.submit(
+                                        state.ui.prompt.clone(),
+                                        config,
+                                        Some(state.ui.clip.clone()),
+                                    );
+                                    state.pending_request_id = Some(id);
+                                    state.ui.status = agent_ui::GenerationStatus::Working;
+                                    state.ui.status_message.clear();
+                                    async_executor.execute_background(GenerateTask(id));
+                                }
+                            }
+                        }
+                        agent_ui::UiAction::LoadMidFile => match load_clip_from_file() {
+                            Ok(Some(clip)) => {
+                                state.ui.status_message =
+                                    format!("Loaded {} notes from file.", clip.notes.len());
+                                clip_publisher.publish(clip.clone());
+                                state.ui.clip = clip;
+                                state.ui.status = agent_ui::GenerationStatus::Done;
+                            }
+                            Ok(None) => {
+                                // The user cancelled the file picker.
+                            }
+                            Err(message) => {
+                                state.ui.status_message = message;
+                                state.ui.status = agent_ui::GenerationStatus::Error;
+                            }
+                        },
                         agent_ui::UiAction::Save => {
                             state.ui.save_message = Some(save_clip_to_file(&state.ui.clip));
                         }
@@ -443,6 +480,25 @@ fn save_clip_to_file(clip: &MidiClip) -> Result<String, String> {
     std::fs::write(&path, bytes)
         .map_err(|err| format!("could not write {}: {err}", path.display()))?;
     Ok(format!("Saved to {}.", path.display()))
+}
+
+/// Opens a native "open file" dialog, and reads the chosen path as a
+/// standard MIDI file, using the Phase 1 code
+/// (`MidiClip::from_smf_bytes`). Returns `Ok(None)` if the user cancels
+/// the dialog, since that is not a failure.
+fn load_clip_from_file() -> Result<Option<MidiClip>, String> {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("MIDI file", &["mid", "midi"])
+        .pick_file()
+    else {
+        return Ok(None);
+    };
+
+    let bytes =
+        std::fs::read(&path).map_err(|err| format!("could not read {}: {err}", path.display()))?;
+    let clip = MidiClip::from_smf_bytes(&bytes)
+        .map_err(|err| format!("could not read {} as MIDI: {err}", path.display()))?;
+    Ok(Some(clip))
 }
 
 impl ClapPlugin for AgentPlugin {
