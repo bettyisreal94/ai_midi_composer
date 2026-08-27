@@ -168,5 +168,5 @@ Read `TODO.md` first. It has the full plan, split into phases. Pick an unchecked
 
 ## License
 
-The project license is not chosen yet. See `TODO.md`, section 10.
+This project uses a dual license: MIT or Apache-2.0, at your choice. See `LICENSE-MIT` and `LICENSE-APACHE` for the full text, and `TODO.md`, section 10, for what is still open (checking dependency licenses, and a clear statement that users own their generated MIDI files).
 

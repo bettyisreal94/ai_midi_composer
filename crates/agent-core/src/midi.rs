@@ -4,7 +4,7 @@
 //! signature. This module also converts a [`MidiClip`] to the bytes of a
 //! standard MIDI file, and back.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use midly::{
@@ -25,7 +25,8 @@ pub struct Note {
     /// The MIDI pitch. Valid range: 0 to 127. Middle C is 60.
     pub pitch: u8,
     /// The note velocity, or how hard the note is played. Valid range:
-    /// 0 to 127.
+    /// 1 to 127. MIDI treats a note-on with velocity 0 as a note-off,
+    /// so a velocity of 0 cannot make an audible note.
     pub velocity: u8,
     /// The start time, in ticks from the start of the clip.
     pub start: u32,
@@ -36,6 +37,9 @@ pub struct Note {
 }
 
 /// A musical time signature, such as 4/4 or 3/4.
+///
+/// `denominator` must be a power of two, because that is what the
+/// standard MIDI file format requires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeSignature {
     pub numerator: u8,
@@ -56,7 +60,8 @@ impl Default for TimeSignature {
 pub struct MidiClip {
     /// How many ticks make one quarter note.
     pub ticks_per_quarter: u16,
-    /// The playback tempo, in beats per minute.
+    /// The playback tempo, in beats per minute. Must be finite and
+    /// greater than 0.
     pub tempo_bpm: f64,
     pub time_signature: TimeSignature,
     pub notes: Vec<Note>,
@@ -76,9 +81,26 @@ impl Default for MidiClip {
 /// An error from building or reading MIDI data.
 #[derive(Debug)]
 pub enum MidiError {
-    /// A note field does not fit the MIDI file format, such as a pitch
-    /// above 127.
+    /// A field does not fit the MIDI file format, such as a pitch above
+    /// 127, or a time signature denominator that is not a power of two.
     OutOfRange { field: &'static str, value: u32 },
+    /// A note has velocity 0. MIDI treats this as a note-off, so the
+    /// note could never be heard.
+    SilentNote,
+    /// A note has duration 0.
+    ZeroDuration,
+    /// Two or more notes use the same channel and pitch, and overlap in
+    /// time. Exporting this would produce a file where the note-on and
+    /// note-off events cannot be matched back to the original notes
+    /// without guessing, so this project rejects it instead.
+    OverlappingNotes { channel: u8, pitch: u8 },
+    /// The tempo is not finite, or not greater than 0.
+    InvalidTempo(f64),
+    /// The tempo is too slow or too fast to fit the MIDI file format.
+    TempoOutOfRange,
+    /// A gap between two events is too large to fit the MIDI file
+    /// format.
+    TickOverflow,
     /// The MIDI file bytes could not be parsed.
     Parse(midly::Error),
     /// The file uses a timing format this project does not support.
@@ -90,6 +112,23 @@ impl fmt::Display for MidiError {
         match self {
             MidiError::OutOfRange { field, value } => {
                 write!(f, "value {value} does not fit in field '{field}'")
+            }
+            MidiError::SilentNote => {
+                write!(f, "a note has velocity 0, so it would be silent")
+            }
+            MidiError::ZeroDuration => write!(f, "a note has duration 0"),
+            MidiError::OverlappingNotes { channel, pitch } => write!(
+                f,
+                "channel {channel} has two overlapping notes at pitch {pitch}"
+            ),
+            MidiError::InvalidTempo(bpm) => {
+                write!(f, "tempo {bpm} beats per minute is not valid")
+            }
+            MidiError::TempoOutOfRange => {
+                write!(f, "tempo does not fit the MIDI file format")
+            }
+            MidiError::TickOverflow => {
+                write!(f, "a gap between events does not fit the MIDI file format")
             }
             MidiError::Parse(err) => write!(f, "could not parse the MIDI file: {err}"),
             MidiError::UnsupportedTiming => {
@@ -121,6 +160,35 @@ fn to_u4(field: &'static str, value: u8) -> Result<u4, MidiError> {
     })
 }
 
+/// Finds the first pair of notes that share a channel and pitch, and
+/// overlap in time. Returns `None` if there is no such pair.
+///
+/// This scans a `BTreeMap`, not a `HashMap`, so the result is the same
+/// every time this function runs on the same input.
+fn find_overlap(notes: &[Note]) -> Option<(u8, u8)> {
+    let mut by_key: BTreeMap<(u8, u8), Vec<(u32, u32)>> = BTreeMap::new();
+    for note in notes {
+        let end = note.start.saturating_add(note.duration.max(1));
+        by_key
+            .entry((note.channel, note.pitch))
+            .or_default()
+            .push((note.start, end));
+    }
+
+    for (key, mut intervals) in by_key {
+        intervals.sort_by_key(|&(start, _)| start);
+        for pair in intervals.windows(2) {
+            let (_, first_end) = pair[0];
+            let (second_start, _) = pair[1];
+            if second_start < first_end {
+                return Some(key);
+            }
+        }
+    }
+
+    None
+}
+
 /// One entry in the flat event timeline used while writing a MIDI file.
 struct TimedEvent {
     tick: u32,
@@ -135,21 +203,46 @@ struct TimedEvent {
 impl MidiClip {
     /// Converts this clip to the bytes of a standard MIDI file, format
     /// 0 (one track).
+    ///
+    /// This fails if the clip has a value that does not fit the file
+    /// format: an out-of-range pitch, velocity, or channel; a silent
+    /// (velocity 0) or zero-duration note; a non-power-of-two time
+    /// signature denominator; a tempo that is not finite and positive;
+    /// or a gap between events that is too large to encode. It also
+    /// fails if two notes share a channel and pitch and overlap in
+    /// time, since such a file could not be read back without
+    /// guessing which note-on matches which note-off.
     pub fn to_smf_bytes(&self) -> Result<Vec<u8>, MidiError> {
-        let mut events = Vec::with_capacity(self.notes.len() * 2 + 2);
+        if let Some((channel, pitch)) = find_overlap(&self.notes) {
+            return Err(MidiError::OverlappingNotes { channel, pitch });
+        }
 
-        let micros_per_quarter = if self.tempo_bpm > 0.0 {
-            (60_000_000.0 / self.tempo_bpm).round() as u32
-        } else {
-            500_000
-        };
+        if !self.tempo_bpm.is_finite() || self.tempo_bpm <= 0.0 {
+            return Err(MidiError::InvalidTempo(self.tempo_bpm));
+        }
+        let micros_per_quarter = (60_000_000.0 / self.tempo_bpm).round();
+        if !(1.0..=16_777_215.0).contains(&micros_per_quarter) {
+            return Err(MidiError::TempoOutOfRange);
+        }
+        let micros_per_quarter =
+            u24::try_from(micros_per_quarter as u32).ok_or(MidiError::TempoOutOfRange)?;
+
+        if self.time_signature.denominator == 0
+            || !self.time_signature.denominator.is_power_of_two()
+        {
+            return Err(MidiError::OutOfRange {
+                field: "time_signature.denominator",
+                value: self.time_signature.denominator as u32,
+            });
+        }
+        let denominator_pow2 = self.time_signature.denominator.trailing_zeros() as u8;
+
+        let mut events = Vec::with_capacity(self.notes.len() * 2 + 2);
         events.push(TimedEvent {
             tick: 0,
             order: 0,
-            kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::from(micros_per_quarter))),
+            kind: TrackEventKind::Meta(MetaMessage::Tempo(micros_per_quarter)),
         });
-
-        let denominator_pow2 = self.time_signature.denominator.trailing_zeros() as u8;
         events.push(TimedEvent {
             tick: 0,
             order: 0,
@@ -165,7 +258,16 @@ impl MidiClip {
             let channel = to_u4("channel", note.channel)?;
             let pitch = to_u7("pitch", note.pitch)?;
             let velocity = to_u7("velocity", note.velocity)?;
-            let end_tick = note.start.saturating_add(note.duration.max(1));
+            if note.velocity == 0 {
+                return Err(MidiError::SilentNote);
+            }
+            if note.duration == 0 {
+                return Err(MidiError::ZeroDuration);
+            }
+            let end_tick = note
+                .start
+                .checked_add(note.duration)
+                .ok_or(MidiError::TickOverflow)?;
 
             events.push(TimedEvent {
                 tick: note.start,
@@ -198,8 +300,9 @@ impl MidiClip {
         for event in events {
             let delta = event.tick.saturating_sub(previous_tick);
             previous_tick = event.tick;
+            let delta = u28::try_from(delta).ok_or(MidiError::TickOverflow)?;
             track.push(TrackEvent {
-                delta: u28::from(delta),
+                delta,
                 kind: event.kind,
             });
         }
@@ -230,9 +333,18 @@ impl MidiClip {
     /// Reads a clip back from the bytes of a standard MIDI file.
     ///
     /// This function reads every track and merges their notes into one
-    /// clip. It uses the first tempo and time signature it finds, and
-    /// the defaults from [`MidiClip::default`] if it finds none. It
-    /// silently drops any note-on event that has no matching note-off.
+    /// clip. Each track's delta times count from that track's own
+    /// start, which matches the standard MIDI file format. The clip
+    /// uses the first tempo and time signature found in any track, and
+    /// the defaults from [`MidiClip::default`] if it finds none.
+    ///
+    /// This function is lenient, because it may read files this
+    /// project did not write. A note-on with no matching note-off is
+    /// dropped. A zero-length note is kept, with its duration rounded
+    /// up to 1 tick. When two note-on events for the same channel and
+    /// pitch overlap, each note-off is matched to the most recently
+    /// opened note-on (last in, first out). This matches how most
+    /// synthesizers handle a retriggered note.
     pub fn from_smf_bytes(bytes: &[u8]) -> Result<MidiClip, MidiError> {
         let smf = Smf::parse(bytes)?;
 
@@ -247,7 +359,7 @@ impl MidiClip {
 
         for track in &smf.tracks {
             let mut tick: u32 = 0;
-            let mut pending: HashMap<(u8, u8), (u32, u8)> = HashMap::new();
+            let mut pending: HashMap<(u8, u8), Vec<(u32, u8)>> = HashMap::new();
 
             for event in track {
                 tick = tick.saturating_add(u32::from(event.delta));
@@ -275,19 +387,26 @@ impl MidiClip {
                         let channel = u8::from(channel);
                         match message {
                             MidiMessage::NoteOn { key, vel } if u8::from(vel) > 0 => {
-                                pending.insert((channel, u8::from(key)), (tick, u8::from(vel)));
+                                pending
+                                    .entry((channel, u8::from(key)))
+                                    .or_default()
+                                    .push((tick, u8::from(vel)));
                             }
                             MidiMessage::NoteOn { key, .. } | MidiMessage::NoteOff { key, .. } => {
-                                if let Some((start, velocity)) =
-                                    pending.remove(&(channel, u8::from(key)))
-                                {
-                                    notes.push(Note {
-                                        pitch: u8::from(key),
-                                        velocity,
-                                        start,
-                                        duration: tick.saturating_sub(start).max(1),
-                                        channel,
-                                    });
+                                let map_key = (channel, u8::from(key));
+                                if let Some(stack) = pending.get_mut(&map_key) {
+                                    if let Some((start, velocity)) = stack.pop() {
+                                        notes.push(Note {
+                                            pitch: u8::from(key),
+                                            velocity,
+                                            start,
+                                            duration: tick.saturating_sub(start).max(1),
+                                            channel,
+                                        });
+                                    }
+                                    if stack.is_empty() {
+                                        pending.remove(&map_key);
+                                    }
                                 }
                             }
                             _ => {}
@@ -347,6 +466,16 @@ mod tests {
         }
     }
 
+    fn note(pitch: u8, velocity: u8, start: u32, duration: u32, channel: u8) -> Note {
+        Note {
+            pitch,
+            velocity,
+            start,
+            duration,
+            channel,
+        }
+    }
+
     #[test]
     fn round_trip_keeps_notes() {
         let clip = sample_clip();
@@ -379,13 +508,7 @@ mod tests {
     #[test]
     fn out_of_range_pitch_is_rejected() {
         let clip = MidiClip {
-            notes: vec![Note {
-                pitch: 200,
-                velocity: 100,
-                start: 0,
-                duration: 480,
-                channel: 0,
-            }],
+            notes: vec![note(200, 100, 0, 480, 0)],
             ..MidiClip::default()
         };
 
@@ -393,5 +516,290 @@ mod tests {
             .to_smf_bytes()
             .expect_err("pitch 200 should be rejected");
         assert!(matches!(err, MidiError::OutOfRange { field: "pitch", .. }));
+    }
+
+    #[test]
+    fn zero_velocity_note_is_rejected() {
+        let clip = MidiClip {
+            notes: vec![note(60, 0, 0, 480, 0)],
+            ..MidiClip::default()
+        };
+
+        let err = clip
+            .to_smf_bytes()
+            .expect_err("velocity 0 should be rejected");
+        assert!(matches!(err, MidiError::SilentNote));
+    }
+
+    #[test]
+    fn zero_duration_note_is_rejected() {
+        let clip = MidiClip {
+            notes: vec![note(60, 100, 0, 0, 0)],
+            ..MidiClip::default()
+        };
+
+        let err = clip
+            .to_smf_bytes()
+            .expect_err("duration 0 should be rejected");
+        assert!(matches!(err, MidiError::ZeroDuration));
+    }
+
+    #[test]
+    fn overlapping_same_pitch_and_channel_is_rejected_on_export() {
+        let clip = MidiClip {
+            notes: vec![note(60, 100, 0, 100, 0), note(60, 90, 50, 100, 0)],
+            ..MidiClip::default()
+        };
+
+        let err = clip
+            .to_smf_bytes()
+            .expect_err("overlapping notes should be rejected");
+        assert!(matches!(
+            err,
+            MidiError::OverlappingNotes {
+                channel: 0,
+                pitch: 60
+            }
+        ));
+    }
+
+    #[test]
+    fn back_to_back_same_pitch_notes_are_allowed() {
+        // The first note ends exactly when the second one starts. This
+        // is not an overlap.
+        let clip = MidiClip {
+            notes: vec![note(60, 100, 0, 100, 0), note(60, 90, 100, 100, 0)],
+            ..MidiClip::default()
+        };
+
+        let bytes = clip
+            .to_smf_bytes()
+            .expect("back-to-back notes should encode");
+        let parsed = MidiClip::from_smf_bytes(&bytes).expect("bytes should decode");
+        assert_eq!(parsed.notes, clip.notes);
+    }
+
+    #[test]
+    fn invalid_time_signature_denominator_is_rejected() {
+        let clip = MidiClip {
+            time_signature: TimeSignature {
+                numerator: 4,
+                denominator: 3,
+            },
+            ..MidiClip::default()
+        };
+
+        let err = clip
+            .to_smf_bytes()
+            .expect_err("denominator 3 is not a power of two");
+        assert!(matches!(
+            err,
+            MidiError::OutOfRange {
+                field: "time_signature.denominator",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn non_finite_tempo_is_rejected() {
+        let clip = MidiClip {
+            tempo_bpm: f64::NAN,
+            ..MidiClip::default()
+        };
+        assert!(matches!(
+            clip.to_smf_bytes(),
+            Err(MidiError::InvalidTempo(_))
+        ));
+
+        let clip = MidiClip {
+            tempo_bpm: -10.0,
+            ..MidiClip::default()
+        };
+        assert!(matches!(
+            clip.to_smf_bytes(),
+            Err(MidiError::InvalidTempo(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_bytes_do_not_panic() {
+        let err = MidiClip::from_smf_bytes(b"not a midi file")
+            .expect_err("garbage bytes should not parse");
+        assert!(matches!(err, MidiError::Parse(_)));
+    }
+
+    #[test]
+    fn large_gap_is_rejected_on_export() {
+        // u28's maximum value is 268,435,455. A gap larger than that
+        // cannot be stored as one delta time.
+        let clip = MidiClip {
+            notes: vec![note(60, 100, 0, 300_000_000, 0)],
+            ..MidiClip::default()
+        };
+
+        let err = clip
+            .to_smf_bytes()
+            .expect_err("a gap this large should be rejected");
+        assert!(matches!(err, MidiError::TickOverflow));
+    }
+
+    #[test]
+    fn to_smf_bytes_is_deterministic() {
+        let clip = sample_clip();
+        let first = clip.to_smf_bytes().expect("clip should encode");
+        let second = clip.to_smf_bytes().expect("clip should encode again");
+        assert_eq!(first, second);
+    }
+
+    /// Builds the bytes of a single-track standard MIDI file directly
+    /// with `midly` types, so the test can create event sequences that
+    /// `MidiClip::to_smf_bytes` would reject, such as overlapping notes.
+    fn build_single_track_smf(ticks_per_quarter: u16, track: Track<'static>) -> Vec<u8> {
+        let smf = Smf {
+            header: Header::new(
+                Format::SingleTrack,
+                Timing::Metrical(u15::try_from(ticks_per_quarter).unwrap()),
+            ),
+            tracks: vec![track],
+        };
+        let mut bytes = Vec::new();
+        smf.write(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn overlapping_notes_use_last_in_first_out_matching_on_import() {
+        // Note A: pitch 60, starts at tick 0.
+        // Note B: pitch 60, same channel, starts at tick 50, while A is
+        // still playing.
+        // Event order: NoteOn A @0, NoteOn B @50, NoteOff @100, NoteOff @150.
+        // LIFO matching pairs the first NoteOff with B (the most
+        // recently opened note), and the second NoteOff with A.
+        let track: Track = vec![
+            TrackEvent {
+                delta: u28::from(0),
+                kind: TrackEventKind::Midi {
+                    channel: u4::from(0),
+                    message: MidiMessage::NoteOn {
+                        key: u7::from(60),
+                        vel: u7::from(100),
+                    },
+                },
+            },
+            TrackEvent {
+                delta: u28::from(50),
+                kind: TrackEventKind::Midi {
+                    channel: u4::from(0),
+                    message: MidiMessage::NoteOn {
+                        key: u7::from(60),
+                        vel: u7::from(90),
+                    },
+                },
+            },
+            TrackEvent {
+                delta: u28::from(50),
+                kind: TrackEventKind::Midi {
+                    channel: u4::from(0),
+                    message: MidiMessage::NoteOff {
+                        key: u7::from(60),
+                        vel: u7::from(0),
+                    },
+                },
+            },
+            TrackEvent {
+                delta: u28::from(50),
+                kind: TrackEventKind::Midi {
+                    channel: u4::from(0),
+                    message: MidiMessage::NoteOff {
+                        key: u7::from(60),
+                        vel: u7::from(0),
+                    },
+                },
+            },
+            TrackEvent {
+                delta: u28::from(0),
+                kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+            },
+        ];
+        let bytes = build_single_track_smf(480, track);
+
+        let parsed = MidiClip::from_smf_bytes(&bytes).expect("bytes should decode");
+        assert_eq!(
+            parsed.notes,
+            vec![note(60, 100, 0, 150, 0), note(60, 90, 50, 50, 0)]
+        );
+    }
+
+    #[test]
+    fn multi_track_import_merges_notes_from_every_track() {
+        let track_a: Track = vec![
+            TrackEvent {
+                delta: u28::from(0),
+                kind: TrackEventKind::Midi {
+                    channel: u4::from(0),
+                    message: MidiMessage::NoteOn {
+                        key: u7::from(60),
+                        vel: u7::from(100),
+                    },
+                },
+            },
+            TrackEvent {
+                delta: u28::from(100),
+                kind: TrackEventKind::Midi {
+                    channel: u4::from(0),
+                    message: MidiMessage::NoteOff {
+                        key: u7::from(60),
+                        vel: u7::from(0),
+                    },
+                },
+            },
+            TrackEvent {
+                delta: u28::from(0),
+                kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+            },
+        ];
+        let track_b: Track = vec![
+            TrackEvent {
+                delta: u28::from(0),
+                kind: TrackEventKind::Midi {
+                    channel: u4::from(1),
+                    message: MidiMessage::NoteOn {
+                        key: u7::from(64),
+                        vel: u7::from(90),
+                    },
+                },
+            },
+            TrackEvent {
+                delta: u28::from(200),
+                kind: TrackEventKind::Midi {
+                    channel: u4::from(1),
+                    message: MidiMessage::NoteOff {
+                        key: u7::from(64),
+                        vel: u7::from(0),
+                    },
+                },
+            },
+            TrackEvent {
+                delta: u28::from(0),
+                kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+            },
+        ];
+
+        let smf = Smf {
+            header: Header::new(
+                Format::Parallel,
+                Timing::Metrical(u15::try_from(480).unwrap()),
+            ),
+            tracks: vec![track_a, track_b],
+        };
+        let mut bytes = Vec::new();
+        smf.write(&mut bytes).unwrap();
+
+        let parsed = MidiClip::from_smf_bytes(&bytes).expect("bytes should decode");
+        assert_eq!(
+            parsed.notes,
+            vec![note(60, 100, 0, 100, 0), note(64, 90, 0, 200, 1)]
+        );
     }
 }
