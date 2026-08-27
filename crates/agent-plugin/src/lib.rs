@@ -1,11 +1,11 @@
-//! Phase 2 plugin skeleton.
+//! Phase 3 plugin skeleton.
 //!
-//! This plugin does not generate MIDI from a prompt yet. It plays back
-//! one small, fixed `MidiClip`, so later phases have a real MIDI path
-//! (data model, plugin category, live output, and a save-to-file
-//! action) to build on. See `TODO.md`, Phase 2, for the full plan and
-//! for what phase this leaves open (drag-and-drop out of the plugin
-//! window).
+//! This plugin does not call a real AI model yet. Phase 2 added a
+//! fixed, looping demo clip, sent as live MIDI output. This phase adds
+//! the prompt text box, the "Generate" button, and the status label,
+//! but wires the button to a stub: it always produces the same fixed
+//! clip, no matter what the prompt says. Phase 4 and Phase 5 replace
+//! the stub with a real AI provider call. See `TODO.md`, Phase 3.
 //!
 //! The audio bus stays present and silent. VST3 has no clean "plugin
 //! that only outputs MIDI" category, so this plugin presents itself as
@@ -66,6 +66,58 @@ fn demo_loop_length_ticks() -> u32 {
     DEFAULT_TICKS_PER_QUARTER as u32 * 4
 }
 
+/// The state shown by the "Generate" status label.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GenerationStatus {
+    /// The user has not pressed "Generate" yet this session.
+    Idle,
+    /// A generation request is running. Nothing sets this yet: the
+    /// Phase 3 stub generator finishes inline, with no visible delay.
+    /// Phase 4 and Phase 5 add a real network call, which sets this
+    /// state while it runs.
+    #[allow(dead_code)]
+    Working,
+    /// The last generation request finished, and produced a clip.
+    Done,
+    /// The last generation request failed, or the user gave bad input.
+    Error,
+}
+
+/// The editor's own state: the prompt text, the last generation
+/// result, and the clip currently shown and saved. This is separate
+/// from [`AgentPlugin::clip`], which is the fixed clip the audio thread
+/// plays back live. Phase 5 connects the two, by sending a freshly
+/// generated clip to the audio thread; this phase does not, to keep
+/// its scope small.
+struct EditorState {
+    prompt: String,
+    status: GenerationStatus,
+    status_message: String,
+    clip: MidiClip,
+}
+
+impl Default for EditorState {
+    fn default() -> Self {
+        Self {
+            prompt: String::new(),
+            status: GenerationStatus::Idle,
+            status_message: String::new(),
+            clip: demo_clip(),
+        }
+    }
+}
+
+/// The stub behind the "Generate" button. A real prompt-to-MIDI call
+/// (Phase 4 and Phase 5) will replace this. For now, it always returns
+/// the same fixed clip, and only fails when the prompt is empty, so the
+/// error path has a real, testable way to trigger.
+fn generate_stub(prompt: &str) -> Result<MidiClip, &'static str> {
+    if prompt.trim().is_empty() {
+        return Err("Type a prompt first.");
+    }
+    Ok(demo_clip())
+}
+
 struct AgentPlugin {
     params: Arc<AgentPluginParams>,
     egui_state: Arc<EguiState>,
@@ -119,28 +171,70 @@ impl Plugin for AgentPlugin {
     }
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        let clip = self.clip.clone();
         let loop_beats = self.loop_length_ticks / self.clip.ticks_per_quarter as u32;
         create_egui_editor(
             self.egui_state.clone(),
-            (),
+            EditorState::default(),
             |_, _| {},
-            move |ctx, _setter, _state| {
+            move |ctx, _setter, state| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.heading("AI MIDI Agent (dev)");
                     ui.label(
-                        "This is a Phase 2 skeleton. It plays back one fixed demo \
-                         clip. It does not generate MIDI from a prompt yet.",
+                        "This is a Phase 3 skeleton. \"Generate\" always makes the \
+                         same fixed clip. It does not call a real AI model yet.",
                     );
                     ui.separator();
 
+                    ui.label("Prompt:");
+                    ui.text_edit_multiline(&mut state.prompt);
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Generate").clicked() {
+                            // `generate_stub` runs to completion inline, so
+                            // `GenerationStatus::Working` is never actually
+                            // shown yet. It stays defined and handled below
+                            // for Phase 4 and Phase 5, which replace this
+                            // stub with a real network call that takes
+                            // visible time.
+                            match generate_stub(&state.prompt) {
+                                Ok(clip) => {
+                                    state.status_message =
+                                        format!("Generated {} notes (stub).", clip.notes.len());
+                                    state.clip = clip;
+                                    state.status = GenerationStatus::Done;
+                                }
+                                Err(message) => {
+                                    state.status_message = message.to_string();
+                                    state.status = GenerationStatus::Error;
+                                }
+                            }
+                        }
+
+                        let (label, color) = match state.status {
+                            GenerationStatus::Idle => ("idle".to_string(), egui::Color32::GRAY),
+                            GenerationStatus::Working => {
+                                ("working…".to_string(), egui::Color32::YELLOW)
+                            }
+                            GenerationStatus::Done => {
+                                (state.status_message.clone(), egui::Color32::GREEN)
+                            }
+                            GenerationStatus::Error => {
+                                (state.status_message.clone(), egui::Color32::RED)
+                            }
+                        };
+                        ui.colored_label(color, label);
+                    });
+
+                    ui.separator();
                     ui.label(format!(
-                        "Demo clip: {} notes, {} BPM, loops every {} beats.",
-                        clip.notes.len(),
-                        clip.tempo_bpm as u32,
+                        "Loaded clip: {} notes, {} BPM. The Phase 2 demo clip playing \
+                         live still loops every {} beats, on its own; \"Generate\" does \
+                         not change it yet (Phase 5 connects the two).",
+                        state.clip.notes.len(),
+                        state.clip.tempo_bpm as u32,
                         loop_beats,
                     ));
-                    for note in &clip.notes {
+                    for note in &state.clip.notes {
                         ui.label(format!(
                             "  pitch {} · velocity {} · start tick {}",
                             note.pitch, note.velocity, note.start
@@ -153,7 +247,7 @@ impl Plugin for AgentPlugin {
                          \"Save as .mid\" and drag the file into your DAW instead.",
                     );
                     if ui.button("Save as .mid...").clicked() {
-                        save_clip_to_file(&clip);
+                        save_clip_to_file(&state.clip);
                     }
                 });
             },
@@ -266,8 +360,8 @@ impl Plugin for AgentPlugin {
 
 /// Opens a native "save file" dialog, and writes `clip` to the chosen
 /// path as a standard MIDI file. Does nothing if the user cancels the
-/// dialog. Logs to stderr on failure, since this phase has no status
-/// display in the plugin window yet (Phase 3 adds one).
+/// dialog. Logs failures with `nih_log!`, rather than the status label,
+/// since a save error is rare enough not to need its own UI state yet.
 fn save_clip_to_file(clip: &MidiClip) {
     let Some(path) = rfd::FileDialog::new()
         .add_filter("MIDI file", &["mid", "midi"])

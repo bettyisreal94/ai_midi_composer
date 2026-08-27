@@ -260,16 +260,31 @@ support.
       Linux machine is available yet.
 
 ### Phase 3 — Basic user interface
-- [ ] Add a text box for the prompt.
-- [ ] Add a "Generate" button.
-- [ ] Add a status label for "working", "done", and "error" states.
-- [ ] Wire the button to a stub function. The stub returns a fixed
-      `MidiClip` for now.
-- [ ] Wire the Phase 2 "Save as .mid" button to whatever `MidiClip` the
-      interface currently holds, so a later generated clip replaces the
-      Phase 2 placeholder clip without further plumbing work. Add the
-      drag-out control from Phase 2 here too, once that phase's
-      platform-specific drag-and-drop work is done.
+- [x] Add a text box for the prompt. A multi-line `egui` text box, in
+      the same editor window `nih_plug_egui` added in Phase 2.
+- [x] Add a "Generate" button.
+- [x] Add a status label for "working", "done", and "error" states. See
+      `GenerationStatus` in `crates/agent-plugin/src/lib.rs`. The
+      "working" state is defined and handled, but nothing sets it yet:
+      the Phase 3 stub finishes inline, with no visible delay. Phase 4
+      and Phase 5 add a real network call, which will set it.
+- [x] Wire the button to a stub function. The stub returns a fixed
+      `MidiClip` for now. See `generate_stub()`. It also fails on an
+      empty prompt, with a message shown through the "error" status, so
+      that state has a real, testable way to trigger, and is not just
+      defined and unused.
+- [x] Wire the Phase 2 "Save as .mid" button to whatever `MidiClip` the
+      interface currently holds. Note: the editor's clip (what
+      "Generate" and "Save as .mid" use) and `AgentPlugin::clip` (what
+      the audio thread plays back live, from Phase 2) are still two
+      separate values. Phase 5 connects them, by sending a freshly
+      generated clip to the audio thread. Keeping them separate for now
+      matches the architecture note in section 5: UI-only state does
+      not need to cross to the audio thread until there is a real
+      reason to send it there.
+- [ ] Add the drag-out control from Phase 2 here, once that phase's
+      platform-specific drag-and-drop work is done. Still not done; see
+      Phase 2.
 
 ### Phase 4 — AI provider clients
 - [ ] Define an `AiProvider` trait with one method: send a prompt, return
