@@ -19,6 +19,7 @@
 
 mod background;
 mod scheduler;
+mod settings;
 
 use std::sync::Arc;
 
@@ -161,10 +162,13 @@ impl Plugin for AgentPlugin {
         let generation_store = self.generation_store.clone();
         let initial_clip = self.clip.clone();
 
+        let mut ui_state = agent_ui::EditorState::new(initial_clip);
+        ui_state.settings.api_key = settings::load_api_key(ui_state.settings.kind);
+
         create_egui_editor(
             self.egui_state.clone(),
             PluginEditorState {
-                ui: agent_ui::EditorState::new(initial_clip),
+                ui: ui_state,
                 pending_request_id: None,
             },
             |_, _| {},
@@ -211,6 +215,25 @@ impl Plugin for AgentPlugin {
                         }
                         agent_ui::UiAction::Save => {
                             state.ui.save_message = Some(save_clip_to_file(&state.ui.clip));
+                        }
+                        agent_ui::UiAction::ProviderKindChanged => {
+                            // Show whatever key is already saved for
+                            // the newly picked provider, instead of
+                            // leaving the previous provider's key
+                            // visible under the wrong provider.
+                            let defaults =
+                                agent_ui::ProviderSettings::defaults_for(state.ui.settings.kind);
+                            state.ui.settings.api_key =
+                                settings::load_api_key(state.ui.settings.kind);
+                            state.ui.settings.base_url = defaults.base_url;
+                            state.ui.settings.model = defaults.model;
+                            state.ui.settings_message = None;
+                        }
+                        agent_ui::UiAction::SaveApiKey => {
+                            state.ui.settings_message = Some(settings::save_api_key(
+                                state.ui.settings.kind,
+                                &state.ui.settings.api_key,
+                            ));
                         }
                     }
                 }

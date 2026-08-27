@@ -372,15 +372,41 @@ fixed here, ahead of Phase 4, since Phase 4 builds directly on both:
       fixed maximum height.
 
 ### Phase 4 — AI provider clients
-- [ ] Define an `AiProvider` trait with one method: send a prompt, return
-      text.
-- [ ] Implement the trait for OpenAI-compatible APIs. Support a
+
+This phase builds the provider clients, and the settings the user needs
+to configure them. It does not wire them into the "Generate" button:
+that button still uses the Phase 3 stub. Connecting a real provider
+call to a real `MidiClip` is Phase 5's job, since it also needs a
+prompt template and a JSON reply format, which do not exist yet.
+
+- [x] Define an `AiProvider` trait with one method: send a prompt, return
+      text. See `crates/agent-core/src/provider.rs`. Every provider call
+      is blocking (synchronous), not `async`, so it can run inside a
+      `nih_plug` background task with no separate async runtime; see
+      section 5.
+- [x] Implement the trait for OpenAI-compatible APIs. Support a
       configurable base URL, so the same code works for OpenAI, DeepSeek,
-      OpenRouter, Ollama, and LM Studio.
-- [ ] Implement the trait for the Anthropic Claude API.
-- [ ] Add a settings panel in the UI for provider choice, API key, and
-      base URL.
-- [ ] Store the API key with the `keyring` crate.
+      OpenRouter, Ollama, and LM Studio. See `OpenAiCompatibleProvider`.
+      Tested against a small, local, single-response HTTP server built
+      with `std::net::TcpListener`, not a real network call: a
+      successful reply, an error status, and a malformed response body.
+- [x] Implement the trait for the Anthropic Claude API. See
+      `AnthropicProvider`. Tested the same way as the OpenAI-compatible
+      client.
+- [x] Add a settings panel in the UI for provider choice, API key, and
+      base URL. See `agent_ui::ProviderSettings`, and the "Provider
+      settings" section `agent_ui::draw()` adds. Picking a different
+      provider kind loads whatever key is already saved for it, instead
+      of leaving the previous provider's key visible under the wrong
+      one.
+- [x] Store the API key with the `keyring` crate. See
+      `crates/agent-plugin/src/settings.rs`, the only place in the
+      project that calls into `keyring`; `agent-ui` does not know the
+      keychain exists. Saving happens only when the user presses "Save
+      API key", not on every keystroke. This has not been confirmed
+      against a real macOS Keychain permission prompt, or against a
+      real Linux Secret Service provider (for example GNOME Keyring or
+      KWallet); see section 11.
 
 ### Phase 5 — Prompt-to-MIDI pipeline
 - [ ] Write a system prompt that asks the model for MIDI notes in a fixed
@@ -479,6 +505,12 @@ fixed here, ahead of Phase 4, since Phase 4 builds directly on both:
       tested, since that needs a real or mocked `nih_plug` `Transport`;
       it is only exercised indirectly, by `clap-validator`'s
       `transport-fuzz` tests.
+- [x] Add unit tests for the AI provider clients in `agent-core`. Not in
+      the original plan for this section; added in Phase 4. Both
+      clients are tested against a small local HTTP server, covering a
+      successful reply, a non-success status code, and a malformed
+      response body, with no real network call and no real API key
+      needed.
 - [ ] Add unit tests for the JSON parsing code in the prompt pipeline.
 - [ ] Add a manual test checklist. Run it before each release:
   - [ ] Plugin loads in a Linux host.
@@ -526,3 +558,15 @@ fixed here, ahead of Phase 4, since Phase 4 builds directly on both:
       already include, but this project has not tested that yet. Do
       this once a Linux machine is available, alongside the Phase 0 DAW
       check.
+- [ ] The API key storage added in Phase 4 (`keyring`) has not been
+      confirmed against a real permission prompt. Reading a key that
+      does not exist yet was tested (it just returns nothing, with no
+      prompt), but this project has not tested saving a real key on
+      macOS, where an ad-hoc-signed development build's code signature
+      can change on every rebuild, which can make the OS treat it as a
+      "different app" and re-prompt for Keychain access on every build.
+      This also has not been tested against a real Linux Secret Service
+      provider (for example GNOME Keyring or KWallet). Do this once a
+      maintainer can test both by hand; consider a proper Developer ID
+      signature for macOS before release, so Keychain access stays
+      stable across builds.
