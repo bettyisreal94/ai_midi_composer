@@ -15,6 +15,7 @@ nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "f36931f
 nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "f36931f7af4646065488a9845d8f8c2f95252c23" }
 rfd = "0.14"
 keyring = "3"
+triple_buffer = "7"
 
 [package.metadata.bundler]
 name = "AI MIDI Agent"

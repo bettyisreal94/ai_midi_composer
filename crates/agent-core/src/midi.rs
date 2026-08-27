@@ -212,18 +212,22 @@ struct TimedEvent {
 }
 
 impl MidiClip {
-    /// Converts this clip to the bytes of a standard MIDI file, format
-    /// 0 (one track).
+    /// Checks that every field of this clip fits the standard MIDI
+    /// file format, without building the bytes. [`Self::to_smf_bytes`]
+    /// calls this first. Also useful on its own, when only a yes/no
+    /// answer is needed, such as after parsing a clip from an AI
+    /// provider's reply.
     ///
-    /// This fails if the clip has a value that does not fit the file
-    /// format: an out-of-range pitch, velocity, or channel; a silent
-    /// (velocity 0) or zero-duration note; a non-power-of-two time
-    /// signature denominator; a tempo that is not finite and positive;
-    /// or a gap between events that is too large to encode. It also
-    /// fails if two notes share a channel and pitch and overlap in
-    /// time, since such a file could not be read back without
-    /// guessing which note-on matches which note-off.
-    pub fn to_smf_bytes(&self) -> Result<Vec<u8>, MidiError> {
+    /// Returns an error for: an out-of-range pitch, velocity, or
+    /// channel; a silent (velocity 0) or zero-duration note; a
+    /// non-power-of-two time signature denominator; a
+    /// ticks-per-quarter-note of 0; a tempo that is not finite and
+    /// positive, or that does not fit the file format's tempo field;
+    /// a gap between events that is too large to encode; or two notes
+    /// that share a channel and pitch and overlap in time, since such
+    /// a file could not be read back without guessing which note-on
+    /// matches which note-off.
+    pub fn validate(&self) -> Result<(), MidiError> {
         if let Some((channel, pitch)) = find_overlap(&self.notes) {
             return Err(MidiError::OverlappingNotes { channel, pitch });
         }
@@ -242,8 +246,6 @@ impl MidiClip {
         if !(1.0..=16_777_215.0).contains(&micros_per_quarter) {
             return Err(MidiError::TempoOutOfRange);
         }
-        let micros_per_quarter =
-            u24::try_from(micros_per_quarter as u32).ok_or(MidiError::TempoOutOfRange)?;
 
         if self.time_signature.denominator == 0
             || !self.time_signature.denominator.is_power_of_two()
@@ -253,6 +255,36 @@ impl MidiClip {
                 value: self.time_signature.denominator as u32,
             });
         }
+
+        for note in &self.notes {
+            to_u4("channel", note.channel)?;
+            to_u7("pitch", note.pitch)?;
+            to_u7("velocity", note.velocity)?;
+            if note.velocity == 0 {
+                return Err(MidiError::SilentNote);
+            }
+            if note.duration == 0 {
+                return Err(MidiError::ZeroDuration);
+            }
+            note.start
+                .checked_add(note.duration)
+                .ok_or(MidiError::TickOverflow)?;
+        }
+
+        Ok(())
+    }
+
+    /// Converts this clip to the bytes of a standard MIDI file, format
+    /// 0 (one track). Fails with the same errors as [`Self::validate`].
+    pub fn to_smf_bytes(&self) -> Result<Vec<u8>, MidiError> {
+        self.validate()?;
+
+        // These recompute values `validate()` already checked, to get
+        // the typed values `midly` needs for encoding. `validate()`
+        // having passed means none of the `?` calls below can fail.
+        let micros_per_quarter = (60_000_000.0 / self.tempo_bpm).round();
+        let micros_per_quarter =
+            u24::try_from(micros_per_quarter as u32).ok_or(MidiError::TempoOutOfRange)?;
         let denominator_pow2 = self.time_signature.denominator.trailing_zeros() as u8;
 
         let mut events = Vec::with_capacity(self.notes.len() * 2 + 2);
@@ -273,15 +305,11 @@ impl MidiClip {
         });
 
         for note in &self.notes {
+            // `validate()` already confirmed these fit; these
+            // conversions cannot fail here.
             let channel = to_u4("channel", note.channel)?;
             let pitch = to_u7("pitch", note.pitch)?;
             let velocity = to_u7("velocity", note.velocity)?;
-            if note.velocity == 0 {
-                return Err(MidiError::SilentNote);
-            }
-            if note.duration == 0 {
-                return Err(MidiError::ZeroDuration);
-            }
             let end_tick = note
                 .start
                 .checked_add(note.duration)
@@ -571,6 +599,21 @@ mod tests {
             .to_smf_bytes()
             .expect_err("pitch 200 should be rejected");
         assert!(matches!(err, MidiError::OutOfRange { field: "pitch", .. }));
+    }
+
+    #[test]
+    fn validate_rejects_what_to_smf_bytes_rejects_without_encoding() {
+        let bad_clip = MidiClip {
+            notes: vec![note(200, 100, 0, 480, 0)],
+            ..MidiClip::default()
+        };
+        assert!(matches!(
+            bad_clip.validate(),
+            Err(MidiError::OutOfRange { field: "pitch", .. })
+        ));
+
+        let good_clip = sample_clip();
+        assert!(good_clip.validate().is_ok());
     }
 
     #[test]

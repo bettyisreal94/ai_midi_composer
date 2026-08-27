@@ -114,24 +114,21 @@ creates the `nih_plug_egui` editor window, owns
 crate should not need to know about, such as opening a native save
 dialog with `rfd`.
 
-**Live MIDI output is not yet connected to "Generate".** The Phase 2
-demo clip that plays live, and the clip the editor's "Generate" and
-"Save as .mid" work with, are still two separate values (see Phase 3).
-Sending a freshly generated `MidiClip` to the audio thread, for live
-playback, is still open, and it is harder than "send it over a
-channel": a review after Phase 3 found that replacing an owned
-`MidiClip` on the audio thread can still drop its old, heap-backed
-`Vec<Note>` there, even behind a bounded, non-blocking channel, because
-dropping the old value happens on the audio thread the moment the new
-one replaces it. A real-time-safe design needs the deallocation itself
-to happen off the audio thread: for example, a triple buffer, a
-pre-sized fixed-capacity event buffer the audio thread only ever reads
-from, or an explicit reclamation scheme that hands old buffers back to
-a non-audio thread to free. Because "Save as .mid" already covers the
-main way to get a clip out of this plugin, live playback of a
-generated clip can stay explicitly experimental until this handoff is
-designed properly; do not wire it up with a plain channel of owned
-`MidiClip` values.
+**Live MIDI output is connected to "Generate", since Phase 5.** A
+freshly generated clip reaches the audio thread through a triple
+buffer (`crates/agent-plugin/src/clip_publisher.rs`), not a plain
+channel of owned `MidiClip` values: a review after Phase 3 found that
+replacing an owned value on the audio thread that way can still drop
+its old, heap-backed `Vec<Note>` there, even behind a bounded,
+non-blocking channel, because dropping the old value happens on the
+audio thread the moment the new one replaces it. A triple buffer
+avoids this: writing a new clip (on the editor's, or the background
+task executor's, thread) is what drops the old one, and reading the
+latest clip (on the audio thread) never allocates or drops a value.
+Each published clip carries a generation number, so the audio thread
+can tell a genuine clip replacement apart from an ordinary transport
+update, and clean up and resynchronize only when the clip itself
+changed. See Phase 5 for the full explanation.
 
 ```
                 +----------------+
@@ -168,6 +165,9 @@ designed properly; do not wire it up with a plain channel of owned
 - `serde` and `serde_json` — reads and writes JSON.
 - `keyring` — stores API keys in the OS secure storage (Keychain on
   macOS, Secret Service on Linux).
+- `triple_buffer` — hands a freshly generated `MidiClip` to the audio
+  thread for live playback, without allocating or dropping a value on
+  that thread. See section 5.
 - `directories` — finds the correct config folder on each OS.
 
 ## 7. Repository layout
@@ -426,25 +426,74 @@ prompt template and a JSON reply format, which do not exist yet.
     (for example GNOME Keyring or KWallet); see section 11.
 
 ### Phase 5 — Prompt-to-MIDI pipeline
-- [ ] Write a system prompt that asks the model for MIDI notes in a fixed
+- [x] Write a system prompt that asks the model for MIDI notes in a fixed
       JSON format.
-- [ ] Parse the JSON reply into a `MidiClip`.
-- [ ] Handle bad replies: retry once, then show an error to the user.
-- [ ] Design a real-time-safe way to send a freshly generated `MidiClip`
+  - See `SYSTEM_PROMPT` in `crates/agent-core/src/pipeline.rs`.
+  - The JSON format uses beats (quarter notes), not ticks, for note
+    timing: a model reasons about music in beats far more reliably
+    than in an arbitrary tick resolution. `parse_clip_reply` converts
+    beats to ticks, using `DEFAULT_TICKS_PER_QUARTER`.
+- [x] Parse the JSON reply into a `MidiClip`.
+  - See `parse_clip_reply()`. It tolerates small formatting slips a
+    model commonly makes despite being told not to, such as a
+    Markdown code fence around the JSON object, or text before or
+    after it.
+  - It reuses `MidiClip::validate()` (a new method, factored out of
+    `to_smf_bytes()` so it can run without also building bytes) to
+    decide whether the notes are usable, the same way every other
+    source of a `MidiClip` in this project is checked.
+- [x] Handle bad replies: retry once, then show an error to the user.
+  - See `generate_clip()`. On a bad first reply, it sends a second
+    request that includes the first reply and what was wrong with it,
+    so the model has a real chance to correct itself, not just a blind
+    repeat of the same prompt.
+  - A failure to reach the provider at all (`ProviderError`, for
+    example a bad API key) is not retried this way: it would usually
+    fail the same way again immediately. See `generate_clip()`'s docs
+    for the reasoning.
+  - The error message shown to the user, and fed back to the model on
+    retry, is decided by `agent_ui::draw()` and `agent-plugin`'s
+    editor code, the same as every other status message in the
+    editor.
+- [x] Design a real-time-safe way to send a freshly generated `MidiClip`
       to the audio thread, for live playback.
-  - Do not use a plain channel of owned `MidiClip` values: a review
-    after Phase 3 found that replacing an owned value on the audio
-    thread can still drop its old, heap-backed `Vec<Note>` there, even
-    behind a bounded, non-blocking channel (see section 5).
-  - Use a design that keeps deallocation off the audio thread, such as
-    a triple buffer, or a pre-sized fixed-capacity event buffer the
-    audio thread only reads from.
-- [ ] Test the full path: type a prompt, get real notes from a real
+  - Used a triple buffer (the `triple_buffer` crate), through a new
+    `crates/agent-plugin/src/clip_publisher.rs` module, exactly as
+    this file recommended. Writing a new clip (on the editor's or the
+    background executor's thread) drops the old one there; reading
+    the latest clip (on the audio thread, every `process()` call)
+    never allocates and never drops a value.
+  - Each published clip carries a generation number, so `process()`
+    can tell a genuine clip replacement apart from an ordinary
+    transport update, and clean up (send note-offs for anything still
+    sounding from the old clip) and resynchronize (recompute the loop
+    length from the new clip, and restart the playhead from the
+    host's position, or from 0 if the host reports none) only when the
+    clip itself actually changed.
+  - The demo clip's loop length was a fixed constant (4 beats); a
+    generated clip's is not the same for every clip, so
+    `loop_length_ticks_for()` now computes it from the clip's own last
+    note, every time the clip changes.
+- [x] Test the full path: type a prompt, get real notes from a real
       provider, and confirm the result with the two ways this project
       actually moves a clip into a DAW: dragging or saving the clip
       (once Phase 2's drag-out control exists, or with "Save as .mid"
       until then), and, only as an optional check, routed live
       playback.
+  - Automated tests cover every step of this path except the real
+    network call itself, which already has its own tests in Phase 4
+    (`agent-core`'s provider tests) against a local mock server: the
+    system prompt and JSON parsing (`agent-core::pipeline`, 10
+    tests), the retry behavior (mocked `AiProvider`, no real network
+    call), the clip publisher's generation tracking
+    (`clip_publisher`, 4 tests), and the background request-ID
+    bookkeeping (`background`, 4 tests).
+  - Typing a real prompt, with a real provider and a real API key, and
+    checking the result by ear or by opening the saved `.mid` file in
+    a DAW, has not been done: this needs a maintainer with an API key,
+    and, for the "drag out" half of the acceptance test, still needs
+    Phase 2's drag-and-drop work. Track this alongside the other
+    manual, real-DAW checks in section 9.
   - An earlier version of this file used "see the notes in the host
     piano roll" as the acceptance test; a review after Phase 3 pointed
     out that this does not match how MIDI Agent, or this project's own
@@ -531,7 +580,33 @@ prompt template and a JSON reply format, which do not exist yet.
     covering a successful reply, a non-success status code, and a
     malformed response body, with no real network call and no real
     API key needed.
-- [ ] Add unit tests for the JSON parsing code in the prompt pipeline.
+- [x] Add unit tests for the JSON parsing code in the prompt pipeline.
+  - Added in Phase 5. See `crates/agent-core/src/pipeline.rs`.
+  - Tests cover: a well-formed reply, a reply wrapped in a Markdown
+    code fence and surrounding text, a reply with no JSON object, a
+    reply with no notes, and a reply whose notes fail
+    `MidiClip::validate()`.
+  - The retry behavior (`generate_clip()`) is tested with a scripted
+    `AiProvider` test double that returns canned replies and counts
+    how many times it was called, confirming: a good first reply
+    needs no retry, a bad first reply gets exactly one retry, two bad
+    replies in a row fail with both attempts described, and a
+    provider-level error (not a bad reply) is not retried at all.
+- [x] Add unit tests for the real-time-safe clip handoff to the audio
+      thread.
+  - Not in the original plan; added in Phase 5, alongside the handoff
+    itself. See `crates/agent-plugin/src/clip_publisher.rs`.
+  - Tests cover: the initial clip is readable at generation 0, a
+    published update is readable with a new generation, generation
+    numbers keep increasing across several publishes, and a cloned
+    publisher handle shares the same buffer as the original.
+- [x] Add unit tests for the background request-ID bookkeeping.
+  - Not in the original plan; added in Phase 3.5, expanded in Phase 5.
+    See `crates/agent-plugin/src/background.rs`.
+  - Tests cover only the bookkeeping (assigning IDs, and a result
+    being delivered by `poll()` exactly once), not a real network
+    call: `run()`'s own behavior is already covered by
+    `agent_core::pipeline`'s and `agent_core::provider`'s tests.
 - [ ] Add a manual test checklist. Run it before each release:
   - [ ] Plugin loads in a Linux host.
   - [ ] Plugin loads in a macOS host.

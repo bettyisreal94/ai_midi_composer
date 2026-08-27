@@ -1,37 +1,36 @@
-//! Phase 3 plugin skeleton.
+//! Phase 5 plugin: a real prompt-to-MIDI pipeline.
 //!
-//! This plugin does not call a real AI model yet. Phase 2 added a
-//! fixed, looping demo clip, sent as live MIDI output. Phase 3 added
-//! the prompt text box, the "Generate" button, and the status label,
-//! wired to a stub that always produces the same fixed clip. A review
-//! after Phase 3 (see `REVIEW.md`) found scheduler bugs and an
-//! architecture gap, both fixed here: the live MIDI scheduler
-//! (`scheduler.rs`) now tracks active notes and cleans them up, and
-//! generation now runs through a request-ID based background task seam
-//! (`background.rs`) instead of inline on the UI thread. The UI itself
-//! moved to `agent-ui`, which this crate wires up to `nih_plug_egui`.
-//! Phase 4 and Phase 5 still own replacing the stub with a real AI
-//! provider call. See `TODO.md`, Phase 3 and Phase 4.
+//! Phase 2 added a fixed, looping demo clip, sent as live MIDI output.
+//! Phase 3 added the prompt text box, the "Generate" button, and the
+//! status label, wired to a stub that always produced the same fixed
+//! clip. Phase 4 added the AI provider clients, but did not connect
+//! them to "Generate" yet. This phase makes that connection:
+//! `background::GenerationStore` now runs `agent_core::generate_clip`,
+//! a real call to whichever provider the settings panel is configured
+//! for, and a freshly generated clip replaces the live-playing demo
+//! clip, through [`clip_publisher`].
 //!
 //! The audio bus stays present and silent. VST3 has no clean "plugin
 //! that only outputs MIDI" category, so this plugin presents itself as
 //! an instrument instead, and simply does not fill its audio output.
 
 mod background;
+mod clip_publisher;
 mod scheduler;
 mod settings;
 
 use std::sync::Arc;
 
 use agent_core::midi::{MidiClip, Note, TimeSignature, DEFAULT_TICKS_PER_QUARTER};
-use background::{GenerateTask, GenerationStore};
+use background::{GenerateTask, GenerationStore, ProviderConfig};
+use clip_publisher::{ClipPublisher, ClipReader};
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, EguiState};
 use scheduler::ActiveNotes;
 
-/// Builds the fixed demo clip this phase plays back: a one-octave, four
-/// note arpeggio (C4, E4, G4, C5), one beat apart, looping every 4
-/// beats. Also used by the "Generate" stub in `background.rs`.
+/// Builds the fixed demo clip the plugin plays back before the user
+/// generates anything: a one-octave, four note arpeggio (C4, E4, G4,
+/// C5), one beat apart.
 fn demo_clip() -> MidiClip {
     let beat = DEFAULT_TICKS_PER_QUARTER as u32;
     MidiClip {
@@ -71,11 +70,18 @@ fn demo_clip() -> MidiClip {
     }
 }
 
-/// How long the demo clip loops for, in ticks. This is a plugin-level
-/// concept, not part of the general [`MidiClip`] data model, so it does
-/// not live in `agent-core`.
-fn demo_loop_length_ticks() -> u32 {
-    DEFAULT_TICKS_PER_QUARTER as u32 * 4
+/// How long `clip` loops for, in ticks: the end of its last note. This
+/// is a plugin-level concept, not part of the general [`MidiClip`] data
+/// model, so it does not live in `agent-core`. A generated clip's
+/// length is not fixed the way the demo clip's was, so this is
+/// computed fresh from whatever clip is currently playing, not stored
+/// as a fixed constant.
+fn loop_length_ticks_for(clip: &MidiClip) -> u32 {
+    clip.notes
+        .iter()
+        .map(|note| note.start.saturating_add(note.duration))
+        .max()
+        .unwrap_or(clip.ticks_per_quarter as u32 * 4)
 }
 
 /// The editor's full state: the reusable UI state from `agent-ui`, plus
@@ -91,10 +97,21 @@ struct AgentPlugin {
     params: Arc<AgentPluginParams>,
     egui_state: Arc<EguiState>,
     generation_store: GenerationStore,
-    clip: MidiClip,
-    loop_length_ticks: u32,
-    /// The clip's current playback position, in ticks, wrapped to
-    /// `0..loop_length_ticks`. The audio thread owns this value.
+    /// The editor's, and the background task executor's, side of the
+    /// live-playback clip handoff. See `clip_publisher` for why this
+    /// is a triple buffer, not a plain `MidiClip` field.
+    clip_publisher: ClipPublisher,
+    /// The audio thread's side of the same handoff. Only `process()`
+    /// touches this.
+    clip_reader: ClipReader,
+    /// The generation number `process()` last saw from
+    /// `clip_reader.read()`. Used to tell a genuine clip replacement
+    /// apart from an unrelated transport update, so `process()` can
+    /// clean up and resynchronize only when the clip itself changed.
+    last_seen_generation: u64,
+    /// The clip's current playback position, in ticks, wrapped to the
+    /// current clip's own length (see `loop_length_ticks_for`). The
+    /// audio thread owns this value.
     playhead_ticks: f64,
     /// Which notes the audio thread has sent a note-on for, with no
     /// note-off sent yet. Used to clean up on stop and on a detected
@@ -112,12 +129,14 @@ struct AgentPlugin {
 
 impl Default for AgentPlugin {
     fn default() -> Self {
+        let (clip_publisher, clip_reader) = ClipPublisher::new(demo_clip());
         Self {
             params: Arc::new(AgentPluginParams::default()),
             egui_state: EguiState::from_size(360, 320),
             generation_store: GenerationStore::default(),
-            clip: demo_clip(),
-            loop_length_ticks: demo_loop_length_ticks(),
+            clip_publisher,
+            clip_reader,
+            last_seen_generation: 0,
             playhead_ticks: 0.0,
             active_notes: ActiveNotes::default(),
             expected_host_tick: None,
@@ -160,9 +179,9 @@ impl Plugin for AgentPlugin {
 
     fn editor(&mut self, async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let generation_store = self.generation_store.clone();
-        let initial_clip = self.clip.clone();
+        let clip_publisher = self.clip_publisher.clone();
 
-        let mut ui_state = agent_ui::EditorState::new(initial_clip);
+        let mut ui_state = agent_ui::EditorState::new(demo_clip());
         ui_state.settings.api_key = settings::load_api_key(ui_state.settings.kind);
 
         create_egui_editor(
@@ -181,7 +200,14 @@ impl Plugin for AgentPlugin {
                         match result {
                             Ok(clip) => {
                                 state.ui.status_message =
-                                    format!("Generated {} notes (stub).", clip.notes.len());
+                                    format!("Generated {} notes.", clip.notes.len());
+                                // Send the new clip to the audio thread
+                                // for live playback, and show it in the
+                                // editor for saving. See
+                                // `clip_publisher` for why this is not
+                                // a plain assignment shared with the
+                                // audio thread.
+                                clip_publisher.publish(clip.clone());
                                 state.ui.clip = clip;
                                 state.ui.status = agent_ui::GenerationStatus::Done;
                             }
@@ -206,7 +232,8 @@ impl Plugin for AgentPlugin {
                             // already queued the instant before that
                             // happened.
                             if state.pending_request_id.is_none() {
-                                let id = generation_store.submit(state.ui.prompt.clone());
+                                let config = ProviderConfig::from(&state.ui.settings);
+                                let id = generation_store.submit(state.ui.prompt.clone(), config);
                                 state.pending_request_id = Some(id);
                                 state.ui.status = agent_ui::GenerationStatus::Working;
                                 state.ui.status_message.clear();
@@ -284,9 +311,21 @@ impl Plugin for AgentPlugin {
             return ProcessStatus::Normal;
         }
 
-        let tempo_bpm = transport.tempo.unwrap_or(self.clip.tempo_bpm);
+        // `.read()` never allocates and never drops a value; see
+        // `clip_publisher`. `published.generation` lets this tell a
+        // genuine clip replacement (from a finished "Generate") apart
+        // from an ordinary transport update.
+        let published = self.clip_reader.read();
+        let clip = &published.clip;
+        let clip_changed = published.generation != self.last_seen_generation;
+        self.last_seen_generation = published.generation;
+
+        let loop_length_ticks = loop_length_ticks_for(clip);
+        let loop_len_ticks = loop_length_ticks as f64;
+
+        let tempo_bpm = transport.tempo.unwrap_or(clip.tempo_bpm);
         let samples_per_tick = if tempo_bpm > 0.0 {
-            (60.0 / tempo_bpm) * self.sample_rate as f64 / self.clip.ticks_per_quarter as f64
+            (60.0 / tempo_bpm) * self.sample_rate as f64 / clip.ticks_per_quarter as f64
         } else {
             0.0
         };
@@ -294,38 +333,51 @@ impl Plugin for AgentPlugin {
             return ProcessStatus::Normal;
         }
 
-        let loop_len_ticks = self.loop_length_ticks as f64;
-
         // Detect seeks and other transport discontinuities from the
         // host's musical position (beats), not from
         // `pos_samples() / current tempo`. A project with an earlier
         // tempo change cannot be converted correctly with only the
         // current tempo, since samples-to-ticks depends on every tempo
         // that applied before this point, not just the current one
-        // (see REVIEW.md). `pos_beats()` already accounts for that.
-        let mut cleanup_events = Vec::new();
+        // (see REVIEW.md). `pos_beats()` already accounts for that. A
+        // clip replacement needs the same cleanup and resynchronizing
+        // as a discontinuity: the notes that were sounding, and the
+        // playhead position, belonged to a clip that is no longer
+        // playing.
+        let mut needs_resync = clip_changed;
+        let mut host_tick = None;
         if let Some(beats) = transport.pos_beats() {
-            let host_tick = beats * self.clip.ticks_per_quarter as f64;
+            let tick = beats * clip.ticks_per_quarter as f64;
             let jumped = match self.expected_host_tick {
-                Some(expected) => (host_tick - expected).abs() > 0.5,
+                Some(expected) => (tick - expected).abs() > 0.5,
                 None => true, // the first block since playback started
             };
-            if jumped {
-                cleanup_events = scheduler::stop_all_notes(&mut self.active_notes);
-                self.playhead_ticks = host_tick.rem_euclid(loop_len_ticks);
-            }
-            self.expected_host_tick = Some(host_tick + num_samples as f64 / samples_per_tick);
+            needs_resync = needs_resync || jumped;
+            host_tick = Some(tick);
+            self.expected_host_tick = Some(tick + num_samples as f64 / samples_per_tick);
         } else {
             // No musical position from the host. Let the internal
-            // playhead run continuously; there is nothing more
-            // accurate available to resync it to, or to compare it
-            // against to detect a jump.
+            // playhead run continuously when nothing else changed;
+            // there is nothing more accurate available to resync it
+            // to, or to compare it against to detect a jump.
             self.expected_host_tick = None;
         }
 
+        let cleanup_events = if needs_resync {
+            scheduler::stop_all_notes(&mut self.active_notes)
+        } else {
+            Vec::new()
+        };
+        if needs_resync {
+            // Prefer the host's own position; fall back to the start
+            // of the clip, rather than reusing a playhead position
+            // that belonged to a different clip's timeline.
+            self.playhead_ticks = host_tick.map_or(0.0, |tick| tick.rem_euclid(loop_len_ticks));
+        }
+
         let (mut events, next_tick) = scheduler::schedule_clip_events(
-            &self.clip,
-            self.loop_length_ticks,
+            clip,
+            loop_length_ticks,
             self.playhead_ticks,
             samples_per_tick,
             num_samples,
@@ -333,10 +385,11 @@ impl Plugin for AgentPlugin {
         );
         self.playhead_ticks = next_tick;
 
-        // Cleanup note-offs from a discontinuity close out notes from
-        // before the jump, so they must play first.
-        cleanup_events.append(&mut events);
-        emit_events(context, cleanup_events);
+        // Cleanup note-offs from a discontinuity or a clip change
+        // close out notes from before it, so they must play first.
+        let mut all_events = cleanup_events;
+        all_events.append(&mut events);
+        emit_events(context, all_events);
 
         ProcessStatus::Normal
     }
