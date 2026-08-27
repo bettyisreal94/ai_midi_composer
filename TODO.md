@@ -129,12 +129,20 @@ vst/
 ## 8. Implementation phases
 
 ### Phase 0 — Project setup
-- [ ] Create the Cargo workspace with the three crates above.
-- [ ] Add `nih_plug` as a git dependency and build an empty passthrough
+- [x] Create the Cargo workspace with the three crates above.
+- [x] Add `nih_plug` as a git dependency and build an empty passthrough
       plugin.
-- [ ] Load the empty plugin in a free host on Linux (Reaper or Bitwig) and
-      on macOS (Reaper or Bitwig).
-- [ ] Set up CI to build the workspace on Linux and macOS.
+- [x] Validate the plugin with headless tools, since no DAW is installed
+      on the build machine yet:
+  - [x] `pluginval` (strictness 5) on the VST3 bundle. Result: SUCCESS.
+  - [x] `clap-validator` on the CLAP bundle. Result: 30 passed, 2 failed.
+        Both failures are tracked in section 11 (Open questions). Neither
+        one blocks later phases.
+- [ ] Load the plugin in a real DAW (Reaper or Bitwig) on Linux and on
+      macOS. Do this once a DAW is available on a test machine.
+- [ ] Set up CI to build the workspace on Linux and macOS. Postponed. Do
+      this later, once the project has a git remote and the core features
+      are more stable.
 
 ### Phase 1 — MIDI data model
 - [ ] Define a `Note` struct: pitch, velocity, start time, duration,
@@ -245,3 +253,14 @@ vst/
 - [ ] What is the exact JSON schema for MIDI notes sent by the AI model?
       Draft it early in Phase 5, since many parts of the code depend on
       it.
+- [ ] `nih_plug`'s built-in state loader can try a very large memory
+      allocation when it reads corrupted or random state bytes. This can
+      abort the process. `clap-validator` found this with its
+      `state-invalid-random` test. Track the upstream `nih_plug` issue
+      tracker for a fix, or add a size check before Phase 5, when the
+      plugin starts to save real state (API keys, provider choice, and
+      so on).
+- [ ] `clap-validator`'s `param-conversions` test divides by zero when a
+      plugin has no parameters. This is a bug in `clap-validator`, not in
+      our plugin. Re-run this test once the plugin has real parameters,
+      in a later phase, to confirm it passes then.
