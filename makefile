@@ -51,7 +51,7 @@ else ifeq ($(UNAME_S),Linux)
 	sudo apt-get update
 	sudo apt-get install -y libasound2-dev libjack-jackd2-dev libxcb1-dev \
 	  libxcb-icccm4-dev libxcursor-dev libxkbcommon-dev \
-	  libxcb-shape0-dev libxcb-xfixes0-dev libgtk-3-dev
+	  libxcb-shape0-dev libxcb-xfixes0-dev
 	@echo "bootstrap: pluginval has no Linux package."
 	@echo "bootstrap: get it by hand from https://github.com/Tracktion/pluginval/releases"
 else

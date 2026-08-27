@@ -26,9 +26,10 @@ The plugin builds as a CLAP plugin and as a VST3 plugin. AU and AAX are not part
 vst/
   Cargo.toml          # workspace file
   crates/
-    agent-core/        # MIDI data model and AI provider clients
-    agent-plugin/       # the CLAP/VST3 plugin, built with nih_plug
-    agent-ui/           # the plugin window (not built yet)
+    agent-core/        # MIDI data model; AI provider clients come in Phase 4
+    agent-plugin/       # the CLAP/VST3 plugin: host integration, real-time
+                         # code, and background task execution, using nih_plug
+    agent-ui/           # the plugin window's UI state and rendering, using egui
   xtask/                # build script that creates the plugin bundles
   TODO.md               # the project plan
 ```
@@ -62,10 +63,10 @@ On Linux, you also need these development packages. On Debian and Ubuntu, instal
 ```sh
 sudo apt-get install libasound2-dev libjack-jackd2-dev libxcb1-dev \
   libxcb-icccm4-dev libxcursor-dev libxkbcommon-dev \
-  libxcb-shape0-dev libxcb-xfixes0-dev libgtk-3-dev
+  libxcb-shape0-dev libxcb-xfixes0-dev
 ```
 
-`libgtk-3-dev` is for the "Save as .mid" file dialog, added in Phase 2. It comes from the `rfd` crate's default Linux file dialog backend.
+The "Save as .mid" file dialog, added in Phase 2, uses the `rfd` crate. With `rfd`'s default features, its Linux backend talks to the desktop's XDG desktop portal over D-Bus, so it needs no extra development package at build time. It does need a portal backend running on the desktop at run time (for example `xdg-desktop-portal-gtk` or `xdg-desktop-portal-kde`), which most Linux desktop environments already include. This has not been confirmed on a real Linux desktop yet; see `TODO.md`, section 11.
 
 Other Linux distributions need the same libraries, under different package names.
 

@@ -45,6 +45,7 @@ name = "agent-plugin"
 version = "0.0.1"
 dependencies = [
  "agent-core",
+ "agent-ui",
  "nih_plug",
  "nih_plug_egui",
  "rfd",
@@ -55,6 +56,7 @@ name = "agent-ui"
 version = "0.0.1"
 dependencies = [
  "agent-core",
+ "egui",
 ]
 
 [[package]]
@@ -1550,7 +1552,7 @@ dependencies = [
 [[package]]
 name = "nih_plug"
 version = "0.0.0"
-source = "git+https://github.com/robbert-vdh/nih-plug.git#f36931f7af4646065488a9845d8f8c2f95252c23"
+source = "git+https://github.com/robbert-vdh/nih-plug.git?rev=f36931f7af4646065488a9845d8f8c2f95252c23#f36931f7af4646065488a9845d8f8c2f95252c23"
 dependencies = [
  "anyhow",
  "anymap3",
@@ -1580,7 +1582,7 @@ dependencies = [
 [[package]]
 name = "nih_plug_derive"
 version = "0.1.0"
-source = "git+https://github.com/robbert-vdh/nih-plug.git#f36931f7af4646065488a9845d8f8c2f95252c23"
+source = "git+https://github.com/robbert-vdh/nih-plug.git?rev=f36931f7af4646065488a9845d8f8c2f95252c23#f36931f7af4646065488a9845d8f8c2f95252c23"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1590,7 +1592,7 @@ dependencies = [
 [[package]]
 name = "nih_plug_egui"
 version = "0.0.0"
-source = "git+https://github.com/robbert-vdh/nih-plug.git#f36931f7af4646065488a9845d8f8c2f95252c23"
+source = "git+https://github.com/robbert-vdh/nih-plug.git?rev=f36931f7af4646065488a9845d8f8c2f95252c23#f36931f7af4646065488a9845d8f8c2f95252c23"
 dependencies = [
  "baseview",
  "crossbeam",
@@ -1604,7 +1606,7 @@ dependencies = [
 [[package]]
 name = "nih_plug_xtask"
 version = "0.1.0"
-source = "git+https://github.com/robbert-vdh/nih-plug.git#f36931f7af4646065488a9845d8f8c2f95252c23"
+source = "git+https://github.com/robbert-vdh/nih-plug.git?rev=f36931f7af4646065488a9845d8f8c2f95252c23#f36931f7af4646065488a9845d8f8c2f95252c23"
 dependencies = [
  "anyhow",
  "cargo_metadata",

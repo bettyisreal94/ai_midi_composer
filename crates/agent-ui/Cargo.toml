@@ -7,3 +7,4 @@ repository.workspace = true
 
 [dependencies]
 agent-core = { path = "../agent-core" }
+egui = "0.31"

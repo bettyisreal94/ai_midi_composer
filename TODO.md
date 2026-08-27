@@ -77,38 +77,61 @@ The project has three layers:
    user actions to the plugin crate. It shows results from the plugin
    crate.
 
-The plugin runs network requests on a background thread. The audio thread
-must never wait for a network reply. The audio thread reads results from a
-lock-free queue.
+A review after Phase 3 (see `REVIEW.md`) found that this section's plan
+contradicted itself: it recommended `nih_plug`'s own background task
+mechanism, while section 6 still listed `tokio` as the crate that owns
+the background thread. Phase 3 also had no seam at all for background
+work: the "Generate" button called the stub generator inline, on the UI
+thread. Both are fixed now. This section describes what is actually
+built, not just a plan to check future code against.
 
-A review of phases 0 and 1 (see `REVIEW.md`) asked for this to be more
-specific, before Phase 4 and Phase 5 write real code here. This is the
-intended design, to check against when that code is written:
+**Background work.** `agent-plugin` uses `nih_plug`'s own background
+task mechanism: `Plugin::BackgroundTask`, `Plugin::task_executor()`, and
+`AsyncExecutor::execute_background()`. There is no separate `tokio`
+runtime, and Phase 4's real provider calls should use a blocking HTTP
+client (`reqwest`'s `blocking` feature, not its default async API)
+inside the background task closure, for the same reason: one thread
+pool to reason about, not two. The background task type
+(`background::GenerateTask`) carries only a request ID, not the prompt
+text, so queuing a task never duplicates heap-owned request data. The
+prompt, and the result, live in `background::GenerationStore`, a small
+`Arc<Mutex<...>>` map from request ID to prompt and to result, shared
+between the editor and the task executor, and never touched by the
+audio callback. The editor disables "Generate" while a request is
+pending, so only one request is ever outstanding at a time; this also
+means a stale response from an old request cannot happen yet. A future
+phase that allows several requests at once (for example, a cancel
+button) will need to compare IDs when polling, to drop a response from
+a request a newer one already replaced.
 
-- `agent-plugin` owns a small piece of shared state: the current prompt
-  text, the current status ("idle", "working", "done", "error"), and
-  the most recent generated `MidiClip`. `nih_plug`'s `editor()` method
-  builds the `agent-ui` window from a clone of a handle to this state
-  (for example an `Arc<Mutex<...>>`, or a similar type built for this
-  purpose), so the UI thread can read and write it directly.
-- `nih_plug` has a built-in mechanism for exactly this kind of work: the
-  `Plugin::BackgroundTask` associated type, together with
-  `ProcessContext::execute_background()` and the plugin's task executor
-  closure. Phase 4 and Phase 5 should use this mechanism to run AI
-  provider network calls on a host-managed background thread, instead
-  of adding a separate `tokio` runtime by hand. The `BackgroundTask`
-  placeholder type in the current `agent-plugin` skeleton
-  (`type BackgroundTask = ();`) is there for this: later phases replace
-  `()` with a real task type, such as an enum with a "generate from
-  this prompt" variant.
-- The audio thread must not lock a `Mutex` that the network code might
-  also hold for long. Use a small, bounded, non-blocking channel to
-  hand a finished `MidiClip` from the background task back to the
-  audio-adjacent state (for example a bounded `crossbeam-channel`, read
-  with `try_recv`, which never blocks the audio thread even if empty).
-  Do not read this channel from the UI thread directly; let the UI
-  thread read the shared state that the audio/background side updates
-  after it drains the channel.
+**The three crates.** `agent-ui` now holds the UI's own state
+(`agent_ui::EditorState`) and its rendering (`agent_ui::draw()`), and
+knows nothing about `nih_plug`, request IDs, or the file system. It
+returns which button the user pressed, as an `agent_ui::UiAction`
+value; `agent-plugin` decides what that action means. `agent-plugin`
+creates the `nih_plug_egui` editor window, owns
+`background::GenerationStore`, and does the host-integration work a UI
+crate should not need to know about, such as opening a native save
+dialog with `rfd`.
+
+**Live MIDI output is not yet connected to "Generate".** The Phase 2
+demo clip that plays live, and the clip the editor's "Generate" and
+"Save as .mid" work with, are still two separate values (see Phase 3).
+Sending a freshly generated `MidiClip` to the audio thread, for live
+playback, is still open, and it is harder than "send it over a
+channel": a review after Phase 3 found that replacing an owned
+`MidiClip` on the audio thread can still drop its old, heap-backed
+`Vec<Note>` there, even behind a bounded, non-blocking channel, because
+dropping the old value happens on the audio thread the moment the new
+one replaces it. A real-time-safe design needs the deallocation itself
+to happen off the audio thread: for example, a triple buffer, a
+pre-sized fixed-capacity event buffer the audio thread only ever reads
+from, or an explicit reclamation scheme that hands old buffers back to
+a non-audio thread to free. Because "Save as .mid" already covers the
+main way to get a clip out of this plugin, live playback of a
+generated clip can stay explicitly experimental until this handoff is
+designed properly; do not wire it up with a plain channel of owned
+`MidiClip` values.
 
 ```
                 +----------------+
@@ -130,13 +153,19 @@ intended design, to check against when that code is written:
 ## 6. Rust crates to use
 
 - `nih_plug` — builds CLAP and VST3 plugins from one Rust codebase.
+  Also runs background work off the audio and UI threads, through its
+  own task executor; see section 5. No separate async runtime is
+  needed for this.
 - `nih_plug_egui` — draws the plugin window with `egui`.
+- `egui` — the widget toolkit `agent-ui` draws with. `agent-ui` depends
+  on this directly (not through `nih_plug_egui`), so it stays usable
+  without pulling in `nih_plug`'s windowing backend.
 - `midly` — reads and writes standard MIDI files.
-- `reqwest` — sends HTTP requests to AI providers.
-- `tokio` — runs the background network thread.
+- `reqwest`, with its `blocking` feature, not the default async API —
+  sends HTTP requests to AI providers, from inside a `nih_plug`
+  background task. See section 5 for why this is blocking, not async.
+- `rfd` — opens native file dialogs, such as "Save as .mid".
 - `serde` and `serde_json` — reads and writes JSON.
-- `crossbeam-channel` — sends data between the audio thread and the
-  network thread.
 - `keyring` — stores API keys in the OS secure storage (Keychain on
   macOS, Secret Service on Linux).
 - `directories` — finds the correct config folder on each OS.
@@ -147,9 +176,10 @@ intended design, to check against when that code is written:
 vst/
   Cargo.toml               # workspace file
   crates/
-    agent-core/             # MIDI model, AI clients, prompt logic
-    agent-plugin/           # CLAP/VST3 plugin, uses nih_plug
-    agent-ui/               # egui interface code
+    agent-core/             # MIDI model; AI clients come in Phase 4
+    agent-plugin/           # CLAP/VST3 plugin: host integration, real-time
+                             # code, and background task execution
+    agent-ui/               # the plugin window's UI state and rendering
   xtask/                    # build and bundle scripts
   TODO.md
   README.md
@@ -237,20 +267,45 @@ support.
 - [x] Add a "Save as .mid" button, so the user can export the clip as a
       file, for DAWs or workflows that do not support dragging a clip
       out of a plugin window. Uses the `rfd` crate for a native file
-      save dialog. On Linux, `rfd`'s default backend needs GTK 3
-      development files at build time; this is now in the Linux
-      dependency list in `README.md` and `Makefile`.
+      save dialog. Correction: an earlier version of this file said
+      Linux needs GTK 3 development files for this. A review after
+      Phase 3 found that wrong: with `rfd`'s default features, its
+      Linux backend uses the XDG desktop portal over D-Bus, not GTK 3,
+      so no extra development package is needed at build time. See
+      `README.md`'s Requirements section for the run-time note.
 - [x] As a secondary feature, also send the clip as live MIDI output
       events, for hosts that support live MIDI from a plugin. The clip
       loops, synced to the host's own transport position when the host
-      reports one. `clap-validator`'s `transport-fuzz` and
-      `transport-fuzz-sample-accurate` tests, which change the transport
-      state on every block, both pass, so the event scheduling code
-      handles erratic host transport behavior without crashing or
-      producing invalid audio. A real host-matrix test (which hosts
-      accept live MIDI from a plugin at all) is still open; add it once
-      a DAW is available on a test machine, alongside the Phase 0 DAW
-      check.
+      reports one. A review after Phase 3 (see `REVIEW.md`) found three
+      real bugs in the first version of this scheduler, all fixed, with
+      unit tests, in `crates/agent-plugin/src/scheduler.rs`:
+      - A note ending exactly on the loop boundary never got its
+        note-off, and stayed stuck on forever. Fixed with an asymmetric
+        half-open interval for note starts versus note ends.
+      - Stopping the transport, or a seek, did not send cleanup
+        note-offs for notes already sounding, so they could also stay
+        stuck on. Fixed by tracking active notes (`ActiveNotes`), and
+        sending note-offs for all of them on stop and on a detected
+        transport discontinuity.
+      - A note-off and a note-on at the same sample were sent in
+        whatever order the clip's notes happened to be stored in.
+        Fixed by sorting scheduled events so a note-off always sorts
+        before a note-on at the same sample.
+
+      A related bug was in how the plugin found its position in the
+      clip: it converted `Transport::pos_samples()` to ticks using only
+      the current tempo, which is wrong once a project has an earlier
+      tempo change. Fixed by using `Transport::pos_beats()` instead,
+      which the host already computes correctly across tempo changes.
+
+      `clap-validator`'s `transport-fuzz` and
+      `transport-fuzz-sample-accurate` tests, which change the
+      transport state on every block, both still pass, so the fixed
+      scheduler handles erratic host transport behavior without
+      crashing or producing invalid audio. A real host-matrix test
+      (which hosts accept live MIDI from a plugin at all) is still
+      open; add it once a DAW is available on a test machine, alongside
+      the Phase 0 DAW check.
 - [x] Confirm this works on macOS: `pluginval` (strictness 5) reports
       SUCCESS, including its "Editor" and "Open editor whilst
       processing" tests, and `clap-validator` reports the same 30
@@ -262,29 +317,59 @@ support.
 ### Phase 3 — Basic user interface
 - [x] Add a text box for the prompt. A multi-line `egui` text box, in
       the same editor window `nih_plug_egui` added in Phase 2.
-- [x] Add a "Generate" button.
+- [x] Add a "Generate" button. Disabled while a request is pending, so
+      the user cannot start a second one (see the Phase 3.5 note
+      below).
 - [x] Add a status label for "working", "done", and "error" states. See
-      `GenerationStatus` in `crates/agent-plugin/src/lib.rs`. The
-      "working" state is defined and handled, but nothing sets it yet:
-      the Phase 3 stub finishes inline, with no visible delay. Phase 4
-      and Phase 5 add a real network call, which will set it.
+      `agent_ui::GenerationStatus`. Unlike the first version of this
+      phase, "working" is now real and reachable: pressing "Generate"
+      submits a background task (Phase 3.5 below), and the label shows
+      "working…" until it finishes.
 - [x] Wire the button to a stub function. The stub returns a fixed
-      `MidiClip` for now. See `generate_stub()`. It also fails on an
-      empty prompt, with a message shown through the "error" status, so
-      that state has a real, testable way to trigger, and is not just
-      defined and unused.
+      `MidiClip` for now. See `background::generate_stub()`. It also
+      fails on an empty prompt, with a message shown through the
+      "error" status, so that state has a real, testable way to
+      trigger, and is not just defined and unused.
 - [x] Wire the Phase 2 "Save as .mid" button to whatever `MidiClip` the
-      interface currently holds. Note: the editor's clip (what
-      "Generate" and "Save as .mid" use) and `AgentPlugin::clip` (what
-      the audio thread plays back live, from Phase 2) are still two
-      separate values. Phase 5 connects them, by sending a freshly
-      generated clip to the audio thread. Keeping them separate for now
-      matches the architecture note in section 5: UI-only state does
-      not need to cross to the audio thread until there is a real
-      reason to send it there.
+      interface currently holds. It now also shows whether the save
+      succeeded or failed, in the editor itself, not only in the log (a
+      review after this phase flagged the log-only version as a real
+      gap). Note: the editor's clip (what "Generate" and "Save as .mid"
+      use) and `AgentPlugin::clip` (what the audio thread plays back
+      live, from Phase 2) are still two separate values. Phase 5
+      connects them; see section 5 for why that handoff needs more
+      thought than a plain channel.
 - [ ] Add the drag-out control from Phase 2 here, once that phase's
       platform-specific drag-and-drop work is done. Still not done; see
       Phase 2.
+
+#### Phase 3.5 — UI and background-task restructuring
+
+A review after Phase 3 (see `REVIEW.md`) found two structural problems,
+fixed here, ahead of Phase 4, since Phase 4 builds directly on both:
+
+- [x] Move the UI's reusable state and rendering into `agent-ui`, which
+      was an unused placeholder until now, even though `TODO.md` and
+      `README.md` already described it as owning the plugin window.
+      `agent-ui` now has no dependency on `nih_plug`: it exposes
+      `EditorState`, `GenerationStatus`, `UiAction`, and a `draw()`
+      function that returns which action the user asked for.
+      `agent-plugin` still creates the actual `nih_plug_egui` editor,
+      decides what an action means, and does host-integration work
+      such as opening the save dialog.
+- [x] Give the editor a real seam for background work, instead of
+      calling the stub inline on the UI thread. See
+      `crates/agent-plugin/src/background.rs`: `GenerateTask` carries a
+      request ID, not the prompt text; `GenerationStore` holds the
+      actual prompts and results, behind a `Mutex`, shared between the
+      editor and `Plugin::task_executor()`; and the editor polls for a
+      result each frame while a request is pending. This is real
+      plumbing, even though the work it runs is still the Phase 3 stub.
+      Phase 4 and Phase 5 replace `generate_stub()` with a real
+      provider call; the rest should not need to change.
+- [x] A generated clip's note list no longer grows the window without
+      bound: `agent_ui::draw()` puts it in a scrolling area with a
+      fixed maximum height.
 
 ### Phase 4 — AI provider clients
 - [ ] Define an `AiProvider` trait with one method: send a prompt, return
@@ -302,10 +387,25 @@ support.
       JSON format.
 - [ ] Parse the JSON reply into a `MidiClip`.
 - [ ] Handle bad replies: retry once, then show an error to the user.
-- [ ] Send the finished `MidiClip` to the audio thread through the
-      lock-free queue.
+- [ ] Design a real-time-safe way to send a freshly generated `MidiClip`
+      to the audio thread, for live playback. Do not use a plain
+      channel of owned `MidiClip` values: a review after Phase 3 found
+      that replacing an owned value on the audio thread can still drop
+      its old, heap-backed `Vec<Note>` there, even behind a bounded,
+      non-blocking channel (see section 5). Use a design that keeps
+      deallocation off the audio thread, such as a triple buffer, or a
+      pre-sized fixed-capacity event buffer the audio thread only reads
+      from.
 - [ ] Test the full path: type a prompt, get real notes from a real
-      provider, see the notes in the host piano roll.
+      provider, and confirm the result with the two ways this project
+      actually moves a clip into a DAW: dragging or saving the clip
+      (once Phase 2's drag-out control exists, or with "Save as .mid"
+      until then), and, only as an optional check, routed live
+      playback. An earlier version of this file used "see the notes in
+      the host piano roll" as the acceptance test; a review after
+      Phase 3 pointed out that this does not match how MIDI Agent, or
+      this project's own Phase 2 design, actually moves notes into a
+      DAW.
 
 ### Phase 6 — MIDI import and variation
 - [ ] Add a file picker or drag-and-drop target for `.mid` files.
@@ -356,10 +456,29 @@ support.
 ## 9. Testing plan
 
 - [x] Add unit tests for the MIDI conversion code in `agent-core`. Done
-      in Phase 1. The tests cover normal round trips, and failure modes:
-      out-of-range fields, silent and zero-duration notes, overlapping
-      notes, bad time signatures and tempo, malformed bytes, gaps too
-      large to encode, same-tick retriggers, and multi-track files.
+      in Phase 1, and expanded after a Phase 3 review found real gaps
+      in the import side. The tests now cover normal round trips, and
+      failure modes: out-of-range fields, silent and zero-duration
+      notes, overlapping notes, bad time signatures and tempo
+      (including a tempo too slow to fit the file format's tempo
+      field, not only non-finite or negative tempo), malformed bytes,
+      gaps too large to encode, same-tick retriggers, multi-track
+      files, a zero ticks-per-quarter-note value, a malformed time
+      signature denominator, format 2 (sequential) files, and a
+      per-track tick overflow.
+- [x] Add unit tests for the live MIDI scheduler in `agent-plugin`. Not
+      in the original plan; added after a Phase 3 review found real
+      scheduler bugs (see Phase 2). The scheduling math lives in
+      `crates/agent-plugin/src/scheduler.rs`, with no `nih_plug` types
+      in it, specifically so it can have plain unit tests with no host
+      needed. Tests cover: a single note's on and off, a note left open
+      across two calls, the loop-boundary bug's regression case,
+      starting playback in the middle of a loop, note-off/note-on
+      ordering at the same sample, and cleanup note-offs for stuck
+      notes. Detecting a transport discontinuity itself is not unit
+      tested, since that needs a real or mocked `nih_plug` `Transport`;
+      it is only exercised indirectly, by `clap-validator`'s
+      `transport-fuzz` tests.
 - [ ] Add unit tests for the JSON parsing code in the prompt pipeline.
 - [ ] Add a manual test checklist. Run it before each release:
   - [ ] Plugin loads in a Linux host.
@@ -400,3 +519,10 @@ support.
       plugin has no parameters. This is a bug in `clap-validator`, not in
       our plugin. Re-run this test once the plugin has real parameters,
       in a later phase, to confirm it passes then.
+- [ ] "Save as .mid" (`rfd`, added in Phase 2) has not been confirmed on
+      a real Linux desktop. With `rfd`'s default features, it needs an
+      XDG desktop portal backend running (for example
+      `xdg-desktop-portal-gtk`), which most desktop environments
+      already include, but this project has not tested that yet. Do
+      this once a Linux machine is available, alongside the Phase 0 DAW
+      check.

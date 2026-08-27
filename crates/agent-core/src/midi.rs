@@ -105,6 +105,11 @@ pub enum MidiError {
     Parse(midly::Error),
     /// The file uses a timing format this project does not support.
     UnsupportedTiming,
+    /// The file uses format 2 (independent, sequential tracks). This
+    /// project only reads formats 0 and 1, where every track is part
+    /// of the same, simultaneous performance. Merging format 2's
+    /// tracks the same way would wrongly play unrelated songs at once.
+    UnsupportedFormat,
 }
 
 impl fmt::Display for MidiError {
@@ -133,6 +138,12 @@ impl fmt::Display for MidiError {
             MidiError::Parse(err) => write!(f, "could not parse the MIDI file: {err}"),
             MidiError::UnsupportedTiming => {
                 write!(f, "this project only supports metrical (ticks) timing")
+            }
+            MidiError::UnsupportedFormat => {
+                write!(
+                    f,
+                    "this project cannot read format 2 (independent sequential tracks)"
+                )
             }
         }
     }
@@ -215,6 +226,13 @@ impl MidiClip {
     pub fn to_smf_bytes(&self) -> Result<Vec<u8>, MidiError> {
         if let Some((channel, pitch)) = find_overlap(&self.notes) {
             return Err(MidiError::OverlappingNotes { channel, pitch });
+        }
+
+        if self.ticks_per_quarter == 0 {
+            return Err(MidiError::OutOfRange {
+                field: "ticks_per_quarter",
+                value: 0,
+            });
         }
 
         if !self.tempo_bpm.is_finite() || self.tempo_bpm <= 0.0 {
@@ -338,20 +356,45 @@ impl MidiClip {
     /// uses the first tempo and time signature found in any track, and
     /// the defaults from [`MidiClip::default`] if it finds none.
     ///
-    /// This function is lenient, because it may read files this
-    /// project did not write. A note-on with no matching note-off is
-    /// dropped. A zero-length note is kept, with its duration rounded
-    /// up to 1 tick. When two note-on events for the same channel and
-    /// pitch overlap, each note-off is matched to the most recently
-    /// opened note-on (last in, first out). This matches how most
-    /// synthesizers handle a retriggered note.
+    /// This function is lenient about the data inside each track,
+    /// because it may read files this project did not write:
+    ///
+    /// - A note-on with no matching note-off is dropped.
+    /// - A zero-length note is kept, with its duration rounded up to 1
+    ///   tick.
+    /// - When two note-on events for the same channel and pitch
+    ///   overlap, each note-off is matched to the most recently opened
+    ///   note-on (last in, first out). This matches how most
+    ///   synthesizers handle a retriggered note.
+    /// - A time signature meta event with a denominator too large to
+    ///   represent (as a power of two, in a `u8`) is skipped, as if it
+    ///   were not there.
+    /// - If a track's accumulated tick position would overflow `u32`,
+    ///   this function stops reading that one track at that point, and
+    ///   keeps the notes already read from it. Other tracks are not
+    ///   affected.
+    ///
+    /// It is strict about the file as a whole, and fails with an
+    /// `Err` for: a timing format other than metrical (ticks); a
+    /// ticks-per-quarter-note of 0, which cannot express any note
+    /// length; and format 2 files (see [`MidiError::UnsupportedFormat`]).
     pub fn from_smf_bytes(bytes: &[u8]) -> Result<MidiClip, MidiError> {
         let smf = Smf::parse(bytes)?;
+
+        if smf.header.format == Format::Sequential {
+            return Err(MidiError::UnsupportedFormat);
+        }
 
         let ticks_per_quarter = match smf.header.timing {
             Timing::Metrical(ticks) => u16::from(ticks),
             Timing::Timecode(..) => return Err(MidiError::UnsupportedTiming),
         };
+        if ticks_per_quarter == 0 {
+            return Err(MidiError::OutOfRange {
+                field: "ticks_per_quarter",
+                value: 0,
+            });
+        }
 
         let mut tempo_bpm = None;
         let mut time_signature = None;
@@ -362,7 +405,15 @@ impl MidiClip {
             let mut pending: HashMap<(u8, u8), Vec<(u32, u8)>> = HashMap::new();
 
             for event in track {
-                tick = tick.saturating_add(u32::from(event.delta));
+                tick = match tick.checked_add(u32::from(event.delta)) {
+                    Some(tick) => tick,
+                    // This track's timing has overflowed what this
+                    // project can represent. Keep the notes already
+                    // read from it, and stop reading further events
+                    // from it; any note still open at this point is
+                    // dropped, the same as an unmatched note-on.
+                    None => break,
+                };
 
                 match event.kind {
                     TrackEventKind::Meta(MetaMessage::Tempo(micros_per_quarter)) => {
@@ -376,7 +427,11 @@ impl MidiClip {
                         denominator_pow2,
                         ..,
                     )) => {
-                        if time_signature.is_none() {
+                        // A denominator is `2.pow(denominator_pow2)`. An
+                        // exponent of 8 or more does not fit in a `u8`
+                        // denominator, so treat it as malformed, and
+                        // keep looking for a usable time signature.
+                        if time_signature.is_none() && denominator_pow2 < 8 {
                             time_signature = Some(TimeSignature {
                                 numerator,
                                 denominator: 1u8 << denominator_pow2,
@@ -623,6 +678,23 @@ mod tests {
     }
 
     #[test]
+    fn tempo_too_slow_to_encode_is_rejected() {
+        // At 1 beat per minute, one quarter note takes 60,000,000
+        // microseconds, which does not fit in the file format's 24-bit
+        // tempo field (max 16,777,215). This is different from
+        // `non_finite_tempo_is_rejected`: the value here is finite and
+        // positive, just outside what the file format can store.
+        let clip = MidiClip {
+            tempo_bpm: 1.0,
+            ..MidiClip::default()
+        };
+        assert!(matches!(
+            clip.to_smf_bytes(),
+            Err(MidiError::TempoOutOfRange)
+        ));
+    }
+
+    #[test]
     fn malformed_bytes_do_not_panic() {
         let err = MidiClip::from_smf_bytes(b"not a midi file")
             .expect_err("garbage bytes should not parse");
@@ -801,5 +873,151 @@ mod tests {
             parsed.notes,
             vec![note(60, 100, 0, 100, 0), note(64, 90, 0, 200, 1)]
         );
+    }
+
+    #[test]
+    fn zero_ticks_per_quarter_is_rejected_on_export() {
+        let clip = MidiClip {
+            ticks_per_quarter: 0,
+            ..MidiClip::default()
+        };
+        let err = clip
+            .to_smf_bytes()
+            .expect_err("ticks_per_quarter 0 should be rejected");
+        assert!(matches!(
+            err,
+            MidiError::OutOfRange {
+                field: "ticks_per_quarter",
+                value: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn zero_ticks_per_quarter_is_rejected_on_import() {
+        let track: Track = vec![TrackEvent {
+            delta: u28::from(0),
+            kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+        }];
+        let bytes = build_single_track_smf(0, track);
+
+        let err =
+            MidiClip::from_smf_bytes(&bytes).expect_err("ticks_per_quarter 0 should be rejected");
+        assert!(matches!(
+            err,
+            MidiError::OutOfRange {
+                field: "ticks_per_quarter",
+                value: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn malformed_time_signature_denominator_is_skipped_on_import() {
+        // A denominator exponent of 8 or more does not fit in a `u8`
+        // denominator (2.pow(8) = 256). This must not be treated as a
+        // valid time signature.
+        let track: Track = vec![
+            TrackEvent {
+                delta: u28::from(0),
+                kind: TrackEventKind::Meta(MetaMessage::TimeSignature(4, 250, 24, 8)),
+            },
+            TrackEvent {
+                delta: u28::from(0),
+                kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+            },
+        ];
+        let bytes = build_single_track_smf(480, track);
+
+        let parsed = MidiClip::from_smf_bytes(&bytes).expect("bytes should decode");
+        assert_eq!(parsed.time_signature, TimeSignature::default());
+    }
+
+    #[test]
+    fn format_2_sequential_files_are_rejected() {
+        let track: Track = vec![TrackEvent {
+            delta: u28::from(0),
+            kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+        }];
+        let smf = Smf {
+            header: Header::new(
+                Format::Sequential,
+                Timing::Metrical(u15::try_from(480).unwrap()),
+            ),
+            tracks: vec![track.clone(), track],
+        };
+        let mut bytes = Vec::new();
+        smf.write(&mut bytes).unwrap();
+
+        let err = MidiClip::from_smf_bytes(&bytes).expect_err("format 2 should be rejected");
+        assert!(matches!(err, MidiError::UnsupportedFormat));
+    }
+
+    #[test]
+    fn tick_overflow_truncates_only_the_affected_track() {
+        // u28::MAX is 268,435,455. Accumulating it 16 times, starting
+        // from tick 100, overflows u32::MAX (4,294,967,295) on the
+        // 16th addition. Build a track with one complete note before
+        // that point, 15 harmless filler events that do not overflow,
+        // and then a 16th filler event that does. A note placed after
+        // the 16th filler event must never be reached.
+        let mut track: Track = vec![
+            TrackEvent {
+                delta: u28::from(0),
+                kind: TrackEventKind::Midi {
+                    channel: u4::from(0),
+                    message: MidiMessage::NoteOn {
+                        key: u7::from(60),
+                        vel: u7::from(100),
+                    },
+                },
+            },
+            TrackEvent {
+                delta: u28::from(100),
+                kind: TrackEventKind::Midi {
+                    channel: u4::from(0),
+                    message: MidiMessage::NoteOff {
+                        key: u7::from(60),
+                        vel: u7::from(0),
+                    },
+                },
+            },
+        ];
+        for _ in 0..16 {
+            track.push(TrackEvent {
+                delta: u28::from(268_435_455),
+                kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::from(500_000))),
+            });
+        }
+        track.push(TrackEvent {
+            delta: u28::from(0),
+            kind: TrackEventKind::Midi {
+                channel: u4::from(0),
+                message: MidiMessage::NoteOn {
+                    key: u7::from(72),
+                    vel: u7::from(90),
+                },
+            },
+        });
+        track.push(TrackEvent {
+            delta: u28::from(10),
+            kind: TrackEventKind::Midi {
+                channel: u4::from(0),
+                message: MidiMessage::NoteOff {
+                    key: u7::from(72),
+                    vel: u7::from(0),
+                },
+            },
+        });
+        track.push(TrackEvent {
+            delta: u28::from(0),
+            kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+        });
+
+        let bytes = build_single_track_smf(480, track);
+        let parsed = MidiClip::from_smf_bytes(&bytes).expect("bytes should decode");
+
+        // Only the note fully read before the overflow point survives.
+        assert_eq!(parsed.notes, vec![note(60, 100, 0, 100, 0)]);
     }
 }
