@@ -62,8 +62,10 @@ On Linux, you also need these development packages. On Debian and Ubuntu, instal
 ```sh
 sudo apt-get install libasound2-dev libjack-jackd2-dev libxcb1-dev \
   libxcb-icccm4-dev libxcursor-dev libxkbcommon-dev \
-  libxcb-shape0-dev libxcb-xfixes0-dev
+  libxcb-shape0-dev libxcb-xfixes0-dev libgtk-3-dev
 ```
+
+`libgtk-3-dev` is for the "Save as .mid" file dialog, added in Phase 2. It comes from the `rfd` crate's default Linux file dialog backend.
 
 Other Linux distributions need the same libraries, under different package names.
 

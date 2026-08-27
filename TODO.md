@@ -213,25 +213,51 @@ even though the plugin does not make sound. This trades a small,
 harmless oddity (an "instrument" with silent audio) for wide host
 support.
 
-- [ ] Decide, and record here, the exact VST3 category for this plugin
+- [x] Decide, and record here, the exact VST3 category for this plugin
       (for example `Vst3SubCategory::Instrument`), and the CLAP category
       (`ClapFeature::NoteEffect` or `ClapFeature::Instrument`). Keep the
-      dummy stereo audio bus.
-- [ ] Build a small, fixed `MidiClip` value inside the plugin, using the
+      dummy stereo audio bus. Decision: `Vst3SubCategory::Instrument` for
+      VST3, and `ClapFeature::Instrument` (plus `ClapFeature::Stereo`,
+      for the dummy audio bus) for CLAP. See
+      `crates/agent-plugin/src/lib.rs`.
+- [x] Build a small, fixed `MidiClip` value inside the plugin, using the
       Phase 1 data model. This stands in for real AI generation, until
-      Phase 5.
+      Phase 5. See `demo_clip()`: a four-note, one-octave arpeggio,
+      looping every 4 beats.
 - [ ] Add a "drag out" control in the plugin window: the user can drag
-      the generated clip from the plugin into a DAW track. This is the
-      main way to get notes out of the plugin, so treat it as required
-      for version 1, not a stretch goal.
-- [ ] Add a "Save as .mid" button, so the user can export the clip as a
+      the generated clip from the plugin into a DAW track. **Not done.**
+      Neither `egui` nor `baseview` (the windowing crate `nih_plug_egui`
+      uses) has a cross-platform way to start a native OS drag session
+      from inside a plugin window. Doing this for real needs
+      platform-specific code (for example Cocoa's `NSDraggingSession` on
+      macOS, and XDND on Linux X11), which this project has not written
+      or tested yet. "Save as .mid" is the supported way to get the clip
+      out of the plugin for now. Revisit this once a maintainer can test
+      it against a real DAW on both platforms.
+- [x] Add a "Save as .mid" button, so the user can export the clip as a
       file, for DAWs or workflows that do not support dragging a clip
-      out of a plugin window.
-- [ ] As a secondary feature, also send the clip as live MIDI output
-      events, for hosts that support live MIDI from a plugin. Test this
-      on a small, explicit list of hosts, since host support for this
-      varies far more than support for audio effects does.
-- [ ] Confirm this works on Linux and on macOS.
+      out of a plugin window. Uses the `rfd` crate for a native file
+      save dialog. On Linux, `rfd`'s default backend needs GTK 3
+      development files at build time; this is now in the Linux
+      dependency list in `README.md` and `Makefile`.
+- [x] As a secondary feature, also send the clip as live MIDI output
+      events, for hosts that support live MIDI from a plugin. The clip
+      loops, synced to the host's own transport position when the host
+      reports one. `clap-validator`'s `transport-fuzz` and
+      `transport-fuzz-sample-accurate` tests, which change the transport
+      state on every block, both pass, so the event scheduling code
+      handles erratic host transport behavior without crashing or
+      producing invalid audio. A real host-matrix test (which hosts
+      accept live MIDI from a plugin at all) is still open; add it once
+      a DAW is available on a test machine, alongside the Phase 0 DAW
+      check.
+- [x] Confirm this works on macOS: `pluginval` (strictness 5) reports
+      SUCCESS, including its "Editor" and "Open editor whilst
+      processing" tests, and `clap-validator` reports the same 30
+      passed / 2 failed result as Phase 0 and Phase 1, with no new
+      failures (the 2 failures are the pre-existing, documented ones in
+      section 11). Linux is still unconfirmed, same as Phase 0: no
+      Linux machine is available yet.
 
 ### Phase 3 — Basic user interface
 - [ ] Add a text box for the prompt.
@@ -239,10 +265,11 @@ support.
 - [ ] Add a status label for "working", "done", and "error" states.
 - [ ] Wire the button to a stub function. The stub returns a fixed
       `MidiClip` for now.
-- [ ] Wire the Phase 2 drag-out control and "Save as .mid" button to
-      whatever `MidiClip` the interface currently holds, so a later
-      generated clip replaces the Phase 2 placeholder clip without
-      further plumbing work.
+- [ ] Wire the Phase 2 "Save as .mid" button to whatever `MidiClip` the
+      interface currently holds, so a later generated clip replaces the
+      Phase 2 placeholder clip without further plumbing work. Add the
+      drag-out control from Phase 2 here too, once that phase's
+      platform-specific drag-and-drop work is done.
 
 ### Phase 4 — AI provider clients
 - [ ] Define an `AiProvider` trait with one method: send a prompt, return

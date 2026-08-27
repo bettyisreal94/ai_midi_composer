@@ -11,6 +11,8 @@ crate-type = ["cdylib", "lib"]
 [dependencies]
 agent-core = { path = "../agent-core" }
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+rfd = "0.14"
 
 [package.metadata.bundler]
 name = "AI MIDI Agent"
