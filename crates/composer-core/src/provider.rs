@@ -25,14 +25,32 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::json;
 
-/// A provider call gives up after this long. `composer-plugin` runs every
-/// call on `nih_plug`'s shared background worker, so a slow or hung
-/// call can hold that worker for up to this long; keep this well under
-/// a minute so a stuck request cannot make the plugin feel frozen for
-/// too long. Whether plugin unload itself waits for an in-flight call
-/// to finish, or time out, is host and `nih_plug` behavior this
-/// project has not tested against a real host; see `TODO.md`.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// A provider call gives up after this long.
+///
+/// A maintainer found the original value here, 30 seconds, much too
+/// short: a local model server such as Ollama can easily take longer
+/// than that just to load a model into memory before it can answer at
+/// all, on top of however long the actual generation itself takes, and
+/// a cloud provider under heavy load is not much different. Ten
+/// minutes is a deliberately generous ceiling, chosen to almost never
+/// be the reason a real, working request fails, not a guess at a
+/// typical response time.
+///
+/// The real cost of raising this: `composer-plugin` runs every call on
+/// `nih_plug`'s shared background worker, so a slow, or truly hung,
+/// call can now hold that worker for up to ten minutes, not 30 seconds.
+/// Today that is an acceptable trade, since only one request is ever
+/// outstanding at a time (the editor disables "Generate" and "Vary
+/// current clip" while one is pending; see
+/// `background::GenerationStore`'s module docs in `composer-plugin`),
+/// so a slow request only ever blocks a second press of the same
+/// button, not unrelated background work. A future phase that runs
+/// more than one kind of background task at once would need to
+/// revisit this. Whether plugin unload itself waits for an in-flight
+/// call this long to finish, or times out some other way, is host and
+/// `nih_plug` behavior this project has not tested against a real
+/// host; see `TODO.md`.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// A provider reply larger than this is rejected outright, before it
 /// is even parsed as JSON. A JSON object describing a few dozen MIDI
@@ -118,19 +136,28 @@ fn build_client() -> reqwest::blocking::Client {
 }
 
 /// Describes a failed [`reqwest::blocking::Client::send`] call, walking
-/// its `source()` chain, not just its own `Display` text.
+/// its `source()` chain, not just its own `Display` text, and stating
+/// how long the call actually ran for before failing.
 ///
-/// A maintainer found this necessary after seeing an unhelpful error
-/// like "error sending request for url (...)" while debugging a local
-/// Ollama connection: `reqwest::Error`'s own `Display` only describes
-/// the *kind* of failure (building the request, sending it, decoding
-/// the response, ...), not *why* it failed. The actual reason (for
-/// example "tcp connect error: Connection refused", or a DNS failure,
-/// or a timeout) lives one or more levels deeper, in
-/// `std::error::Error::source()`, which `Display` does not include by
-/// itself. Joining the whole chain gives the user something they can
-/// actually act on.
-fn describe_request_error(err: reqwest::Error) -> String {
+/// A maintainer found the `source()` chain necessary after seeing an
+/// unhelpful error like "error sending request for url (...)" while
+/// debugging a local Ollama connection: `reqwest::Error`'s own
+/// `Display` only describes the *kind* of failure (building the
+/// request, sending it, decoding the response, ...), not *why* it
+/// failed. The actual reason (for example "tcp connect error:
+/// Connection refused", or a DNS failure, or a timeout) lives one or
+/// more levels deeper, in `std::error::Error::source()`, which
+/// `Display` does not include by itself.
+///
+/// The elapsed time answers a different, equally real question the
+/// same maintainer then ran into: whether an "operation timed out"
+/// message is actually [`REQUEST_TIMEOUT`] being hit, or something
+/// else entirely that merely happens to be *labeled* as a timeout (for
+/// example a fast connection refusal on one network stack while
+/// `localhost` also resolves to another). `elapsed` should be measured
+/// from just before `.send()` was called, by the caller, since this
+/// function has no way to measure it after the fact.
+fn describe_request_error(err: reqwest::Error, elapsed: Duration) -> String {
     let mut message = err.to_string();
     let mut cause = std::error::Error::source(&err);
     while let Some(source) = cause {
@@ -138,6 +165,7 @@ fn describe_request_error(err: reqwest::Error) -> String {
         message.push_str(&source.to_string());
         cause = source.source();
     }
+    message.push_str(&format!(" (after {:.1}s)", elapsed.as_secs_f64()));
     message
 }
 
@@ -222,6 +250,7 @@ impl AiProvider for OpenAiCompatibleProvider {
         }
 
         let url = join_url(&self.base_url, "chat/completions");
+        let started_at = std::time::Instant::now();
         let response = self
             .client
             .post(&url)
@@ -235,7 +264,9 @@ impl AiProvider for OpenAiCompatibleProvider {
                 ],
             }))
             .send()
-            .map_err(|err| ProviderError::Request(describe_request_error(err)))?;
+            .map_err(|err| {
+                ProviderError::Request(describe_request_error(err, started_at.elapsed()))
+            })?;
 
         let status = response.status();
         let body = read_body_bounded(response)?;
@@ -317,6 +348,7 @@ impl AiProvider for AnthropicProvider {
         }
 
         let url = join_url(&self.base_url, "v1/messages");
+        let started_at = std::time::Instant::now();
         let response = self
             .client
             .post(&url)
@@ -329,7 +361,9 @@ impl AiProvider for AnthropicProvider {
                 "messages": [{"role": "user", "content": user_prompt}],
             }))
             .send()
-            .map_err(|err| ProviderError::Request(describe_request_error(err)))?;
+            .map_err(|err| {
+                ProviderError::Request(describe_request_error(err, started_at.elapsed()))
+            })?;
 
         let status = response.status();
         let body = read_body_bounded(response)?;
@@ -506,6 +540,12 @@ mod tests {
                     message.to_lowercase().contains("refused"),
                     "expected the real connection failure reason (\"connection refused\"), \
                      not just the generic wrapper text; got: {message}"
+                );
+                assert!(
+                    message.contains("(after ") && message.ends_with("s)"),
+                    "expected the message to state how long the call actually ran for, so a \
+                     user or maintainer can tell a real 30-second timeout apart from something \
+                     else that merely fails with a \"timed out\"-shaped message; got: {message}"
                 );
             }
             other => panic!("expected ProviderError::Request, got {other:?}"),
