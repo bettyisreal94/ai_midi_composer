@@ -1,11 +1,13 @@
 # AI MIDI Agent
 
-> Status: work in progress. The plugin does not generate MIDI yet. See
-> `TODO.md` for the full plan.
+> Status: work in progress. The plugin generates, imports, and varies
+> MIDI clips, using a real AI provider. It has not run in a real DAW
+> yet, only in headless validators. See `TODO.md` for the full plan,
+> and section 9 for the manual tests still open.
 
 ## What this project is
 
-This project builds an open source plugin. The plugin will create MIDI data from text prompts. The plugin will use AI language models to do this. The plugin is written in Rust.
+This project builds an open source plugin. The plugin creates MIDI data from text prompts. The plugin uses AI language models to do this. The plugin is written in Rust.
 
 Read `TODO.md` for the full feature plan and the build phases.
 
@@ -26,7 +28,8 @@ The plugin builds as a CLAP plugin and as a VST3 plugin. AU and AAX are not part
 vst/
   Cargo.toml          # workspace file
   crates/
-    agent-core/        # MIDI data model; AI provider clients come in Phase 4
+    agent-core/        # MIDI data model, AI provider clients, and the
+                        # prompt-to-MIDI pipeline
     agent-plugin/       # the CLAP/VST3 plugin: host integration, real-time
                          # code, and background task execution, using nih_plug
     agent-ui/           # the plugin window's UI state and rendering, using egui

@@ -30,21 +30,43 @@ is a paid, closed source plugin. It has these features:
 
 ## 3. Scope for version 1
 
-Version 1 must have these features:
+Version 1 must have these features. A review after Phase 6 found that
+these boxes stayed unchecked even after the phase that built each
+feature was already checked in section 8, with no note about why. This
+section's checkbox now means one specific thing: the feature is built
+and covered by automated tests. It does not mean every manual,
+real-provider, or real-DAW check for that feature has also run yet;
+section 9's manual test checklist, and each phase's own open items in
+section 8, track those separately, and stay unchecked until a
+maintainer runs them by hand.
 
-- [ ] Text-to-MIDI generation. The user types a prompt. The plugin returns
+- [x] Text-to-MIDI generation. The user types a prompt. The plugin returns
       MIDI notes.
-- [ ] MIDI file import. The user loads a MIDI file. The plugin can extend it
+  - Built in Phase 5. Typing a real prompt against a real provider has
+    not been run yet; see Phase 5 and section 9.
+- [x] MIDI file import. The user loads a MIDI file. The plugin can extend it
       or create a variation of it.
-- [ ] Support for OpenAI-compatible chat APIs. This covers OpenAI, DeepSeek,
+  - Built in Phase 6.
+- [x] Support for OpenAI-compatible chat APIs. This covers OpenAI, DeepSeek,
       OpenRouter, Ollama, and LM Studio, because they use the same API
       shape.
-- [ ] Support for the Anthropic Claude API.
-- [ ] A user interface inside the plugin window. The interface has a text
+  - Built in Phase 4. Tested against a local mock server only, not
+    against any of these real services yet; see Phase 4 and section 9.
+- [x] Support for the Anthropic Claude API.
+  - Built in Phase 4, tested the same way as the item above.
+- [x] A user interface inside the plugin window. The interface has a text
       box, a generate button, and a provider settings panel.
-- [ ] Plugin formats: CLAP and VST3.
+  - Built in Phase 3, Phase 3.5, and Phase 4.
+- [x] Plugin formats: CLAP and VST3.
+  - Built in Phase 0 and Phase 2.
 - [ ] Platforms: Linux and macOS.
-- [ ] Local storage of API keys. Keys must not appear in plain log files.
+  - macOS is confirmed with `pluginval` (see Phase 2). Linux has not
+    been confirmed at all yet: no Linux machine has been available.
+    This stays unchecked until that happens.
+- [x] Local storage of API keys. Keys must not appear in plain log files.
+  - Built in Phase 4, hardened after a review; see Phase 4. Not yet
+    confirmed against a real macOS Keychain prompt or a real Linux
+    Secret Service provider; see section 11.
 
 ## 4. Out of scope for version 1
 
@@ -314,6 +336,32 @@ support.
   - A real host-matrix test (which hosts accept live MIDI from a
     plugin at all) is still open; add it once a DAW is available on a
     test machine, alongside the Phase 0 DAW check.
+  - A maintainer later found a critical bug in the Phase 6 rewrite of
+    this same scheduler (the one described above, in section 5, that
+    made it walk a precomputed event list with a cursor, instead of
+    scanning and sorting notes on every audio callback): starting the
+    plugin could make its memory use grow past 50 GB. Two real bugs,
+    both in `crates/agent-plugin/src/scheduler.rs`, caused this,
+    fixed now, with a regression test:
+    - `schedule_events` wrapped its event cursor back to 0 whenever it
+      reached the end of the event list, with no limit on how many
+      times one call could do that. A call whose window spans exactly
+      one full loop, which happens on the very first `process()` call,
+      made the wrapped cursor re-check, and re-emit, the same events
+      forever: an infinite loop that handed the host an unbounded
+      stream of note events straight from the audio thread. Fixed with
+      a plain counter, capped at the event count, since one call can
+      never need to touch an event more than once.
+    - `PlayableClip::index_at_or_after`, used to relocate the cursor
+      after a discontinuity, could land on a note-off sitting exactly
+      at the target tick. `schedule_events`'s own window test for a
+      note-off always rejects that, so resuming exactly on such a tick
+      silently scheduled nothing at all, forever, until the next
+      discontinuity. Fixed by skipping a same-tick note-off, while
+      still landing on a same-tick note-on.
+    - See `crates/agent-plugin/src/scheduler.rs`'s module docs for the
+      full explanation. Running this module's own unit tests, which
+      hung instead of finishing, is what confirmed the first bug.
 - [x] Confirm this works on macOS.
   - `pluginval` (strictness 5) reports SUCCESS, including its "Editor"
     and "Open editor whilst processing" tests.
@@ -421,9 +469,32 @@ prompt template and a JSON reply format, which do not exist yet.
     keychain exists.
   - Saving happens only when the user presses "Save API key", not on
     every keystroke.
-  - This has not been confirmed against a real macOS Keychain
-    permission prompt, or against a real Linux Secret Service provider
-    (for example GNOME Keyring or KWallet); see section 11.
+  - A review found four real problems here, all fixed now:
+    - Every OpenAI-compatible service shared one keychain entry, keyed
+      only on provider kind. Switching between OpenAI, DeepSeek,
+      OpenRouter, Ollama, and LM Studio lost whichever key was saved
+      for the one used before. The keychain entry is now keyed on
+      provider kind *and* base URL, so each distinct service keeps its
+      own key.
+    - Pressing "Save API key" with an empty field silently overwrote a
+      previously saved, valid key with an empty one. Saving an empty
+      or all-whitespace key is now rejected, with a message, instead of
+      saved.
+    - Every keyring failure, not only a genuinely missing key, was
+      treated as "no key saved", which looks identical in the editor
+      to a normal first-run state. A real failure (a locked keychain,
+      no Secret Service running, and so on) is now shown to the user
+      instead of hidden.
+    - `kind`, `base_url`, and `model` were not persisted at all: a
+      plugin restart reset them to `ProviderSettings::defaults_for`'s
+      hard-coded starting point. Pressing "Save API key" now also
+      writes these three non-secret fields to a small JSON file in the
+      OS's normal config directory (`directories` crate), which is
+      read back the next time the editor opens. `api_key` itself is
+      never written to this file; it stays in the keychain.
+  - Still not confirmed against a real macOS Keychain permission
+    prompt, or against a real Linux Secret Service provider (for
+    example GNOME Keyring or KWallet); see section 11.
 
 ### Phase 5 — Prompt-to-MIDI pipeline
 - [x] Write a system prompt that asks the model for MIDI notes in a fixed
@@ -483,11 +554,12 @@ prompt template and a JSON reply format, which do not exist yet.
   - Automated tests cover every step of this path except the real
     network call itself, which already has its own tests in Phase 4
     (`agent-core`'s provider tests) against a local mock server: the
-    system prompt and JSON parsing (`agent-core::pipeline`, 10
+    system prompt and JSON parsing (`agent-core::pipeline`, 8
     tests), the retry behavior (mocked `AiProvider`, no real network
     call), the clip publisher's generation tracking
     (`clip_publisher`, 4 tests), and the background request-ID
-    bookkeeping (`background`, 4 tests).
+    bookkeeping (`background`, 5 tests, one added in Phase 6; see
+    below).
   - Typing a real prompt, with a real provider and a real API key, and
     checking the result by ear or by opening the saved `.mid` file in
     a DAW, has not been done: this needs a maintainer with an API key,
@@ -517,6 +589,18 @@ prompt template and a JSON reply format, which do not exist yet.
   - See `load_clip_from_file()` in `crates/agent-plugin/src/lib.rs`.
     It reads the chosen path's bytes, then calls
     `MidiClip::from_smf_bytes()`.
+  - A review found this read the whole chosen file with no size limit
+    at all, on the UI thread, so an accidental or hostile
+    multi-gigabyte file could stall the editor and exhaust memory. It
+    now checks the file's size first, and also bounds the read itself
+    (the same defense-in-depth shape `agent_core::provider` already
+    uses for a provider response body), and rejects anything over 5 MB
+    before `MidiClip::from_smf_bytes()` ever sees it. Moving the read
+    itself onto a background thread, so a large-but-allowed file
+    cannot stall the UI either, is not done yet; it needs a seam like
+    `background::GenerationStore`'s, but for a file load instead of a
+    provider call. Track this alongside the other resource-limit
+    follow-ups this review found.
 - [x] Add a prompt mode that sends the existing notes plus a text
       instruction, such as "add a harmony line" or "make a variation".
   - Added a second button, "Vary current clip", next to "Generate".
@@ -605,7 +689,10 @@ prompt template and a JSON reply format, which do not exist yet.
   - Tests cover: a single note's on and off, a note left open across
     two calls, the loop-boundary bug's regression case, starting
     playback in the middle of a loop, note-off/note-on ordering at the
-    same sample, and cleanup note-offs for stuck notes.
+    same sample, cleanup note-offs for stuck notes, and, added after
+    the memory-leak bug described in Phase 2 above, five consecutive
+    calls each spanning exactly one full loop, confirming none of them
+    hangs or emits more than one on/off pair per note.
   - Detecting a transport discontinuity itself is not unit tested,
     since that needs a real or mocked `nih_plug` `Transport`; it is
     only exercised indirectly, by `clap-validator`'s `transport-fuzz`
@@ -683,9 +770,6 @@ prompt template and a JSON reply format, which do not exist yet.
       LM Studio, or both?
 - [ ] Should the plugin ship a small, built-in fallback model for offline
       use, or always require the user to set up a provider?
-- [ ] What is the exact JSON schema for MIDI notes sent by the AI model?
-      Draft it early in Phase 5, since many parts of the code depend on
-      it.
 - [ ] `nih_plug`'s built-in state loader can try a very large memory
       allocation when it reads corrupted or random state bytes.
   - This can abort the process. `clap-validator` found this with its

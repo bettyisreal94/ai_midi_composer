@@ -1,14 +1,19 @@
-//! Phase 5 plugin: a real prompt-to-MIDI pipeline.
+//! The CLAP/VST3 plugin: host integration, the editor window, and the
+//! real-time audio callback.
 //!
 //! Phase 2 added a fixed, looping demo clip, sent as live MIDI output.
 //! Phase 3 added the prompt text box, the "Generate" button, and the
 //! status label, wired to a stub that always produced the same fixed
-//! clip. Phase 4 added the AI provider clients, but did not connect
-//! them to "Generate" yet. This phase makes that connection:
-//! `background::GenerationStore` now runs `agent_core::generate_clip`,
-//! a real call to whichever provider the settings panel is configured
-//! for, and a freshly generated clip replaces the live-playing demo
-//! clip, through [`clip_publisher`].
+//! clip. Phase 4 added the AI provider clients. Phase 5 connected them
+//! to "Generate": `background::GenerationStore` runs
+//! `agent_core::generate_clip`, a real call to whichever provider the
+//! settings panel is configured for, and a freshly generated clip
+//! replaces the live-playing demo clip, through [`clip_publisher`].
+//! Phase 6 added "Load .mid..." ([`load_clip_from_file`]) and "Vary
+//! current clip" (`agent_core::generate_variation`, through the same
+//! `GenerationStore`), so a loaded file and a generated variation both
+//! reach the editor, the save path, and live playback the same way a
+//! fresh generation result does.
 //!
 //! The audio bus stays present and silent. VST3 has no clean "plugin
 //! that only outputs MIDI" category, so this plugin presents itself as
@@ -19,6 +24,7 @@ mod clip_publisher;
 mod scheduler;
 mod settings;
 
+use std::io::Read;
 use std::sync::Arc;
 
 use agent_core::midi::{MidiClip, Note, TimeSignature, DEFAULT_TICKS_PER_QUARTER};
@@ -173,7 +179,21 @@ impl Plugin for AgentPlugin {
         let clip_publisher = self.clip_publisher.clone();
 
         let mut ui_state = agent_ui::EditorState::new(demo_clip());
-        ui_state.settings.api_key = settings::load_api_key(ui_state.settings.kind);
+        // Restore whichever provider kind, base URL, and model the user
+        // last saved, so a plugin restart does not reset them to
+        // hard-coded defaults. Falls back to the defaults already set
+        // by `EditorState::new` if no settings file exists yet, or it
+        // cannot be read.
+        if let Some(persisted) = settings::load_persisted_settings() {
+            ui_state.settings = persisted;
+        }
+        match settings::load_api_key(ui_state.settings.kind, &ui_state.settings.base_url) {
+            Ok(api_key) => ui_state.settings.api_key = api_key,
+            Err(message) => {
+                ui_state.settings_message =
+                    Some(Err(format!("could not read the saved API key: {message}")));
+            }
+        }
 
         create_egui_editor(
             self.egui_state.clone(),
@@ -275,20 +295,48 @@ impl Plugin for AgentPlugin {
                             // Show whatever key is already saved for
                             // the newly picked provider, instead of
                             // leaving the previous provider's key
-                            // visible under the wrong provider.
+                            // visible under the wrong provider. The
+                            // base URL must be updated first: the
+                            // keychain entry is keyed on (kind,
+                            // base_url), not on kind alone, so each
+                            // OpenAI-compatible service (OpenAI,
+                            // DeepSeek, OpenRouter, a local server, ...)
+                            // can keep its own separate key.
                             let defaults =
                                 agent_ui::ProviderSettings::defaults_for(state.ui.settings.kind);
-                            state.ui.settings.api_key =
-                                settings::load_api_key(state.ui.settings.kind);
                             state.ui.settings.base_url = defaults.base_url;
                             state.ui.settings.model = defaults.model;
-                            state.ui.settings_message = None;
+                            state.ui.settings_message = match settings::load_api_key(
+                                state.ui.settings.kind,
+                                &state.ui.settings.base_url,
+                            ) {
+                                Ok(api_key) => {
+                                    state.ui.settings.api_key = api_key;
+                                    None
+                                }
+                                Err(message) => {
+                                    state.ui.settings.api_key = String::new();
+                                    Some(Err(format!(
+                                        "could not read the saved API key: {message}"
+                                    )))
+                                }
+                            };
                         }
                         agent_ui::UiAction::SaveApiKey => {
-                            state.ui.settings_message = Some(settings::save_api_key(
+                            let key_result = settings::save_api_key(
                                 state.ui.settings.kind,
+                                &state.ui.settings.base_url,
                                 &state.ui.settings.api_key,
-                            ));
+                            );
+                            // Also persist the non-secret settings
+                            // (kind, base URL, model) alongside the key,
+                            // so they survive a plugin restart too. Best
+                            // effort: a failure here should not hide
+                            // that the API key itself did save.
+                            if key_result.is_ok() {
+                                let _ = settings::save_persisted_settings(&state.ui.settings);
+                            }
+                            state.ui.settings_message = Some(key_result);
                         }
                     }
                 }
@@ -482,6 +530,19 @@ fn save_clip_to_file(clip: &MidiClip) -> Result<String, String> {
     Ok(format!("Saved to {}.", path.display()))
 }
 
+/// A chosen file larger than this is rejected outright, before its
+/// bytes are even read into memory. A real MIDI file worth importing is
+/// at most a few hundred kilobytes; this is generous headroom above
+/// that. A review found that the load path read a whole chosen file
+/// with no limit at all, on the UI thread, which meant an accidental or
+/// hostile multi-gigabyte file could stall the editor and exhaust
+/// memory. This does not move the read itself off the UI thread (a
+/// picked file is normally small enough that the read is fast; see
+/// `TODO.md` for why the bigger move-to-a-background-task change is
+/// tracked separately), but it does stop an oversized file from ever
+/// being read into memory in the first place.
+const MAX_MIDI_FILE_BYTES: u64 = 5_000_000;
+
 /// Opens a native "open file" dialog, and reads the chosen path as a
 /// standard MIDI file, using the Phase 1 code
 /// (`MidiClip::from_smf_bytes`). Returns `Ok(None)` if the user cancels
@@ -494,8 +555,33 @@ fn load_clip_from_file() -> Result<Option<MidiClip>, String> {
         return Ok(None);
     };
 
-    let bytes =
-        std::fs::read(&path).map_err(|err| format!("could not read {}: {err}", path.display()))?;
+    let metadata = std::fs::metadata(&path)
+        .map_err(|err| format!("could not read {}: {err}", path.display()))?;
+    if metadata.len() > MAX_MIDI_FILE_BYTES {
+        return Err(format!(
+            "{} is {} bytes; the limit for a MIDI file is {MAX_MIDI_FILE_BYTES} bytes",
+            path.display(),
+            metadata.len()
+        ));
+    }
+
+    // Bound the actual read too, not just the metadata check: a file
+    // can grow between the check above and this read, and a special
+    // file (for example a named pipe) can report a misleading size, or
+    // none at all.
+    let file = std::fs::File::open(&path)
+        .map_err(|err| format!("could not read {}: {err}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_MIDI_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| format!("could not read {}: {err}", path.display()))?;
+    if bytes.len() as u64 > MAX_MIDI_FILE_BYTES {
+        return Err(format!(
+            "{} is larger than the {MAX_MIDI_FILE_BYTES}-byte limit",
+            path.display()
+        ));
+    }
+
     let clip = MidiClip::from_smf_bytes(&bytes)
         .map_err(|err| format!("could not read {} as MIDI: {err}", path.display()))?;
     Ok(Some(clip))

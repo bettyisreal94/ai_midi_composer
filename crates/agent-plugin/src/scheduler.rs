@@ -47,6 +47,39 @@
 //!   rather than a single flag per key, also means it can tell how
 //!   many overlapping note-ons are active for the same channel and
 //!   pitch, which the earlier `Vec`-based version could not.
+//!
+//! A later review found two more real bugs in this rewrite itself,
+//! both reported by a maintainer who saw the plugin's memory use grow
+//! without bound (past 50 GB) as soon as it started, and confirmed by
+//! running this module's own tests, which hung instead of finishing:
+//!
+//! 1. [`schedule_events`]'s inner loop wrapped `*cursor` back to 0
+//!    whenever it reached the end of the event list, with no limit on
+//!    how many times it could do that inside one call. Whenever a
+//!    call's window spanned exactly one full loop (which happens on
+//!    the very first `process()` call, since playback starts at tick
+//!    0), the wrapped cursor re-checked the same window against events
+//!    it had just emitted moments earlier, which still passed the same
+//!    test that admitted them the first time, so it emitted them
+//!    again, wrapped again, and never stopped: an infinite loop that
+//!    handed the host an unbounded stream of note events from the
+//!    audio thread. A call can only ever touch each event in the list
+//!    once (its window never spans more than one full loop), so a
+//!    plain counter, capped at the event count, closes this with no
+//!    allocation.
+//! 2. [`PlayableClip::index_at_or_after`] compared only an event's tick
+//!    against the target tick, with no regard for the event's kind. It
+//!    could return a note-off sitting exactly at the target tick, which
+//!    [`schedule_events`]'s own window test for a note-off
+//!    (`event_tick > local_tick`, deliberately strict; see point 1
+//!    above the earlier list) always rejects when resuming exactly at
+//!    that tick. That made the very first window check after a
+//!    discontinuity fail immediately, before ever reaching the
+//!    note-on that starts at the same tick, right after it in the
+//!    sorted list, so nothing further got scheduled at all. Skipping a
+//!    same-tick note-off, while still landing on a same-tick note-on,
+//!    fixes this, and matches [`schedule_events`]'s own two window
+//!    tests exactly.
 
 use agent_core::midi::MidiClip;
 
@@ -95,7 +128,11 @@ impl ActiveNotes {
     /// unmatched note-on. Exposed for tests.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.counts.iter().flatten().filter(|&&count| count > 0).count()
+        self.counts
+            .iter()
+            .flatten()
+            .filter(|&&count| count > 0)
+            .count()
     }
 }
 
@@ -208,12 +245,33 @@ impl PlayableClip {
         self.events.is_empty()
     }
 
-    /// The index of the first event at or after `tick`, found by
-    /// binary search, not a scan. Used to relocate the cursor
+    /// The index of the first event that [`schedule_events`] would
+    /// actually accept when resuming playback exactly at `tick`, found
+    /// by binary search, not a scan. Used to relocate the cursor
     /// [`schedule_events`] needs after a discontinuity, without
     /// walking from the start of the list.
+    ///
+    /// A review found that comparing only `event.tick` against `tick`,
+    /// with no regard for the event's kind, could return a note-off
+    /// sitting exactly at `tick`. `schedule_events`'s own window test
+    /// for a note-off is `event_tick > local_tick` (strict), the same
+    /// asymmetric interval that keeps a note ending exactly on the loop
+    /// boundary from being lost; when resuming exactly at that note-off's
+    /// tick, that test always rejects it, so the caller's very first
+    /// window check failed immediately and stopped, before ever
+    /// reaching the note-on that starts at the same tick, right after
+    /// it in the sorted list. This skips past a note-off at exactly
+    /// `tick` (not eligible to be sent again), while still landing on a
+    /// note-on at exactly `tick` (eligible), matching
+    /// [`schedule_events`]'s own two window tests exactly.
     pub fn index_at_or_after(&self, tick: f64) -> usize {
-        self.events.partition_point(|event| (event.tick as f64) < tick)
+        self.events.partition_point(|event| {
+            let event_tick = event.tick as f64;
+            match event.kind {
+                ScheduledEventKind::NoteOn { .. } => event_tick < tick,
+                ScheduledEventKind::NoteOff => event_tick <= tick,
+            }
+        })
     }
 }
 
@@ -262,7 +320,30 @@ pub fn schedule_events(
         let chunk = remaining.min(samples_left_in_loop.max(1));
         let tick_end = local_tick + chunk as f64 / samples_per_tick;
 
+        // `chunk` is capped by `ticks_left_in_loop` above, so this
+        // window never spans more than one full loop, and can only
+        // ever touch each event in `playable` once. A review found a
+        // real memory-leak bug here: without this cap, once `*cursor`
+        // wraps from the end of the list back to 0 (which happens on
+        // every call whose window reaches exactly the loop boundary,
+        // including the very first `process()` call, since playback
+        // starts at tick 0), the loop re-checks the same
+        // `[local_tick, tick_end)` window against the events it
+        // already emitted moments ago in this same call. Those events
+        // still pass the same `in_window` test that admitted them the
+        // first time, so it emitted them again, wrapped again, and
+        // never terminated: an infinite loop that handed the host an
+        // unbounded stream of note events from the audio thread,
+        // which is what made the plugin's memory use grow without
+        // bound as soon as it started. Counting how many events this
+        // call has visited, and stopping once that reaches the total
+        // number of events, closes this without any allocation, so it
+        // stays safe to call from the audio thread.
+        let mut visited = 0usize;
         loop {
+            if visited >= playable.events.len() {
+                break;
+            }
             if *cursor >= playable.events.len() {
                 *cursor = 0;
             }
@@ -283,7 +364,8 @@ pub fn schedule_events(
                 break;
             }
 
-            let timing = block_offset + ((event_tick - local_tick) * samples_per_tick).round() as u32;
+            let timing =
+                block_offset + ((event_tick - local_tick) * samples_per_tick).round() as u32;
             let timing = timing.min(num_samples.saturating_sub(1) as u32);
             match event.kind {
                 ScheduledEventKind::NoteOn { .. } => active.mark_on(event.channel, event.pitch),
@@ -296,6 +378,7 @@ pub fn schedule_events(
                 kind: event.kind,
             });
             *cursor += 1;
+            visited += 1;
         }
 
         remaining -= chunk;
@@ -396,8 +479,11 @@ mod tests {
         let playable = PlayableClip::from_clip(&clip);
         let mut active = ActiveNotes::default();
         let mut cursor = 0;
-        // 1 sample per tick, so the whole 4-beat loop (3840 ticks)
-        // needs 3840 samples. Ask for exactly the note's own length.
+        // This clip's one note is also its whole loop (960 ticks): 1
+        // sample per tick, so the loop needs 960 samples. Asking for
+        // exactly that many makes this call's window span the whole
+        // loop, which is the exact shape that used to make
+        // `schedule_events` loop forever; see this module's docs.
         let (events, _) = collect_events(&playable, &mut cursor, 0.0, 1.0, 960, &mut active);
 
         assert_eq!(events.len(), 2);
@@ -407,6 +493,36 @@ mod tests {
         assert!(matches!(events[1].kind, ScheduledEventKind::NoteOff));
         // The note-off already closed it, in the same call.
         assert!(!active.is_active(0, 60));
+    }
+
+    #[test]
+    fn a_chunk_spanning_exactly_one_loop_never_emits_more_than_once_per_event() {
+        // Regression test for a real memory-leak bug a review found: a
+        // call whose window spans exactly one full loop (here, every
+        // one of several consecutive calls, each exactly one loop long,
+        // the same shape as one `process()` call per host buffer) used
+        // to make `schedule_events` wrap its cursor and re-emit the
+        // same events forever, without ever returning. If the fix
+        // regresses, this test hangs instead of failing a normal
+        // assertion; see this module's docs for why that shape triggers
+        // it.
+        let (clip, loop_len) = arpeggio(960);
+        let playable = PlayableClip::from_clip(&clip);
+        let mut active = ActiveNotes::default();
+        let mut cursor = 0;
+        let num_samples = loop_len as usize;
+
+        for lap in 0..5 {
+            let (events, next_tick) =
+                collect_events(&playable, &mut cursor, 0.0, 1.0, num_samples, &mut active);
+            assert_eq!(
+                events.len(),
+                8,
+                "lap {lap}: 4 notes, one on and one off each, no more"
+            );
+            assert_eq!(next_tick, 0.0, "a full loop always wraps back to tick 0");
+            assert_eq!(active.len(), 0, "lap {lap}: every note-on was matched");
+        }
     }
 
     #[test]
@@ -523,8 +639,7 @@ mod tests {
         let mut cursor = 0;
         let (events, _) = collect_events(&playable, &mut cursor, 0.0, 1.0, 1920, &mut active);
 
-        let at_boundary: Vec<&ScheduledEvent> =
-            events.iter().filter(|e| e.timing == 960).collect();
+        let at_boundary: Vec<&ScheduledEvent> = events.iter().filter(|e| e.timing == 960).collect();
         assert_eq!(at_boundary.len(), 2);
         assert!(matches!(at_boundary[0].kind, ScheduledEventKind::NoteOff));
         assert!(matches!(
