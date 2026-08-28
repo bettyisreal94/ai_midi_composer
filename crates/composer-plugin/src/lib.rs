@@ -190,8 +190,9 @@ impl Plugin for ComposerPlugin {
         match settings::load_api_key(ui_state.settings.kind, &ui_state.settings.base_url) {
             Ok(api_key) => ui_state.settings.api_key = api_key,
             Err(message) => {
-                ui_state.settings_message =
-                    Some(Err(format!("could not read the saved API key: {message}")));
+                let full_message = format!("could not read the saved API key: {message}");
+                ui_state.error_detail = Some(full_message.clone());
+                ui_state.settings_message = Some(Err(full_message));
             }
         }
 
@@ -223,6 +224,7 @@ impl Plugin for ComposerPlugin {
                                 state.ui.status = composer_ui::GenerationStatus::Done;
                             }
                             Err(message) => {
+                                state.ui.error_detail = Some(message.clone());
                                 state.ui.status_message = message;
                                 state.ui.status = composer_ui::GenerationStatus::Error;
                             }
@@ -255,6 +257,8 @@ impl Plugin for ComposerPlugin {
                         composer_ui::UiAction::GenerateVariation => {
                             if state.pending_request_id.is_none() {
                                 if state.ui.prompt.trim().is_empty() {
+                                    state.ui.error_detail =
+                                        Some("Type an instruction first.".to_string());
                                     state.ui.status_message =
                                         "Type an instruction first.".to_string();
                                     state.ui.status = composer_ui::GenerationStatus::Error;
@@ -284,12 +288,17 @@ impl Plugin for ComposerPlugin {
                                 // The user cancelled the file picker.
                             }
                             Err(message) => {
+                                state.ui.error_detail = Some(message.clone());
                                 state.ui.status_message = message;
                                 state.ui.status = composer_ui::GenerationStatus::Error;
                             }
                         },
                         composer_ui::UiAction::Save => {
-                            state.ui.save_message = Some(save_clip_to_file(&state.ui.clip));
+                            let result = save_clip_to_file(&state.ui.clip);
+                            if let Err(message) = &result {
+                                state.ui.error_detail = Some(message.clone());
+                            }
+                            state.ui.save_message = Some(result);
                         }
                         composer_ui::UiAction::ProviderKindChanged => {
                             // Show whatever key is already saved for
@@ -316,9 +325,10 @@ impl Plugin for ComposerPlugin {
                                 }
                                 Err(message) => {
                                     state.ui.settings.api_key = String::new();
-                                    Some(Err(format!(
-                                        "could not read the saved API key: {message}"
-                                    )))
+                                    let full_message =
+                                        format!("could not read the saved API key: {message}");
+                                    state.ui.error_detail = Some(full_message.clone());
+                                    Some(Err(full_message))
                                 }
                             };
                         }
@@ -336,7 +346,22 @@ impl Plugin for ComposerPlugin {
                             if key_result.is_ok() {
                                 let _ = settings::save_persisted_settings(&state.ui.settings);
                             }
+                            if let Err(message) = &key_result {
+                                state.ui.error_detail = Some(message.clone());
+                            }
                             state.ui.settings_message = Some(key_result);
+                        }
+                        composer_ui::UiAction::CopyErrorToClipboard => {
+                            // `composer-ui` has no OS dependency (see
+                            // its module docs), so it only reports that
+                            // the button was pressed; this is the one
+                            // place that actually reaches the OS
+                            // clipboard, through `arboard`, which talks
+                            // to the OS directly and does not depend on
+                            // `nih_plug_egui`'s own windowing backend
+                            // having clipboard support.
+                            let text = state.ui.error_detail.clone().unwrap_or_default();
+                            state.ui.clipboard_message = Some(copy_to_clipboard(&text));
                         }
                     }
                 }
@@ -506,6 +531,26 @@ fn emit_event(context: &mut impl ProcessContext<ComposerPlugin>, event: schedule
         },
     };
     context.send_event(note_event);
+}
+
+/// Writes `text` to the OS clipboard, using `arboard`, which talks to
+/// the OS clipboard directly. This does not depend on
+/// `nih_plug_egui`'s own windowing backend (`egui-baseview`) having its
+/// own clipboard support, which this project has not confirmed either
+/// way.
+///
+/// Opens a fresh clipboard handle for this one write, rather than
+/// keeping one open for the plugin's whole lifetime: this is only ever
+/// called from a single button press, not from any hot path, so the
+/// small extra cost of opening it each time is not worth the added
+/// state.
+fn copy_to_clipboard(text: &str) -> Result<String, String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|err| format!("could not reach the clipboard: {err}"))?;
+    clipboard
+        .set_text(text.to_string())
+        .map_err(|err| format!("could not copy to the clipboard: {err}"))?;
+    Ok("Copied to clipboard.".to_string())
 }
 
 /// Opens a native "save file" dialog, and writes `clip` to the chosen

@@ -121,6 +121,11 @@ pub enum UiAction {
     ProviderKindChanged,
     /// The user pressed "Save API key".
     SaveApiKey,
+    /// The user pressed "Copy to clipboard" in the error details window.
+    /// `composer-plugin` owns the actual OS clipboard (this crate has no
+    /// OS dependency; see the module docs), so it reads
+    /// `EditorState::error_detail` and writes it there.
+    CopyErrorToClipboard,
 }
 
 /// The editor's own state: the prompt text, the last generation
@@ -139,6 +144,23 @@ pub struct EditorState {
     /// The result of the last "Save API key" attempt, shown the same
     /// way as `save_message`.
     pub settings_message: Option<Result<String, String>>,
+    /// The full text of the most recent error, shown in its own
+    /// floating window (see [`draw`]), separate from the short inline
+    /// label next to whichever button triggered it. A maintainer asked
+    /// for this after finding the inline label too easy to miss, and
+    /// too small to read or copy from, while testing the plugin.
+    /// `None` when there is nothing to show, or the user has closed the
+    /// window. Sending this same text is what `UiAction::Save`,
+    /// `UiAction::SaveApiKey`, and so on already do into
+    /// `status_message`, `save_message`, or `settings_message`;
+    /// `composer-plugin` sets this alongside those, at the same call
+    /// site, whenever the message is an error.
+    pub error_detail: Option<String>,
+    /// The result of the last "Copy to clipboard" press in the error
+    /// details window: `Some("Copied.")` on success, `Some(reason)` on
+    /// failure. `None` before the button has been pressed for the
+    /// error currently shown.
+    pub clipboard_message: Option<Result<String, String>>,
 }
 
 impl EditorState {
@@ -153,6 +175,8 @@ impl EditorState {
             save_message: None,
             settings: ProviderSettings::default(),
             settings_message: None,
+            error_detail: None,
+            clipboard_message: None,
         }
     }
 }
@@ -293,6 +317,67 @@ pub fn draw(
             None => {}
         }
     });
+
+    // A separate, dedicated window for the full text of the most recent
+    // error, so it is not just a small inline label that is easy to
+    // miss or hard to read and copy from. `egui::Window` is a floating
+    // panel inside this plugin's own editor surface, not a second OS
+    // window: `nih_plug_egui`'s windowing backend gives a plugin editor
+    // exactly one OS window, with no supported way to open a second
+    // one, so this is the closest equivalent available.
+    if state.error_detail.is_some() {
+        // `window_open` is egui's own "did the user click the window's
+        // title-bar X" flag; it must stay the only thing written
+        // through the `&mut` borrow `.open()` takes, since the borrow
+        // checker will not allow the `show` closure below to also
+        // assign to it directly (that would be two live mutable
+        // borrows of the same variable at once). The "Close" button is
+        // a separate, ordinary widget inside the window, not a second
+        // way to drive that same flag, so it needs its own variable.
+        let mut window_open = true;
+        let mut close_clicked = false;
+        egui::Window::new("Error details")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(420.0)
+            .open(&mut window_open)
+            .show(ctx, |ui| {
+                let mut text_for_display = state.error_detail.clone().unwrap_or_default();
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut text_for_display)
+                                .interactive(false)
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(10),
+                        );
+                    });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Copy to clipboard").clicked() {
+                        actions.push(UiAction::CopyErrorToClipboard);
+                    }
+                    if ui.button("Close").clicked() {
+                        close_clicked = true;
+                    }
+                });
+                match &state.clipboard_message {
+                    Some(Ok(message)) => {
+                        ui.colored_label(egui::Color32::GREEN, message);
+                    }
+                    Some(Err(message)) => {
+                        ui.colored_label(egui::Color32::RED, message);
+                    }
+                    None => {}
+                }
+            });
+        if !window_open || close_clicked {
+            state.error_detail = None;
+            state.clipboard_message = None;
+        }
+    }
 
     actions
 }
