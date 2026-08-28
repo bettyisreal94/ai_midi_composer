@@ -455,6 +455,19 @@ fixed here, ahead of Phase 4, since Phase 4 builds directly on both:
       bound.
   - `composer_ui::draw()` puts it in a scrolling area with a fixed
     maximum height.
+  - This fixed the note list's own height, but not the page as a
+    whole: a maintainer, testing in a real DAW for the first time,
+    found that the editor's fixed window size (`EguiState::from_size`
+    in `composer-plugin`) was too small for everything below the note
+    list to fit. "Save as .mid..." could end up below the visible
+    area, with no way to scroll down to it, since nothing wrapped the
+    page itself in a scroll area, only the note list. Fixed by
+    wrapping the whole page in `egui::ScrollArea::vertical()`, so every
+    button stays reachable by scrolling no matter how tall the content
+    above it grows, and by making the default window size larger
+    (420x560, was 360x320), so scrolling is rarely needed for normal
+    use. This is the kind of bug automated tests cannot catch, since
+    they never render a layout; only real, visual testing found it.
 
 ### Phase 4 — AI provider clients
 

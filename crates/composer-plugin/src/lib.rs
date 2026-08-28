@@ -128,7 +128,15 @@ impl Default for ComposerPlugin {
         let (clip_publisher, clip_reader) = ClipPublisher::new(demo_clip());
         Self {
             params: Arc::new(ComposerPluginParams::default()),
-            egui_state: EguiState::from_size(360, 320),
+            // A maintainer found the previous size (360x320) too small
+            // for this editor's own content: the "Save as .mid..."
+            // button could end up below the visible area, with no way
+            // to scroll to it. `composer_ui::draw()` now wraps the
+            // whole page in a scroll area as the real fix, so every
+            // button stays reachable regardless of window size; this
+            // larger size just means that is rarely needed in normal
+            // use.
+            egui_state: EguiState::from_size(420, 560),
             generation_store: GenerationStore::default(),
             clip_publisher,
             clip_reader,
