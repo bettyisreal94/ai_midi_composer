@@ -329,23 +329,25 @@ support.
     package is needed at build time. See `README.md`'s Requirements
     section for the run-time note.
   - A maintainer hit a real crash pressing this button in a real DAW
-    for the first time. Neither `save_clip_to_file()` nor
-    `MidiClip::to_smf_bytes()` has an `unwrap()`, `expect()`, or
-    `panic!()` in its own code that a static read could find, so the
-    exact cause is still open; it may be inside `rfd`'s native
-    file-dialog binding itself. Either way, the editor's whole
-    per-frame callback (in `crates/composer-plugin/src/lib.rs`) is now
-    wrapped in `std::panic::catch_unwind`, so a genuine Rust panic
-    anywhere in it, including this button, turns into a normal,
-    visible error instead of crashing the host: a panic that unwinds
-    across the boundary back into the host's own C/C++ code, which is
-    what happens by default, is undefined behavior, and in practice
-    usually aborts the whole process, not just this plugin. This does
-    not catch a crash that never goes through Rust's own panic
-    mechanism at all (a segfault, or an uncaught native exception);
-    confirming which kind this was needs the actual crash log from the
-    maintainer's OS crash reporter, which this project does not have
-    yet.
+    for the first time, on macOS. The editor's whole per-frame callback
+    (in `crates/composer-plugin/src/lib.rs`) was already wrapped in
+    `std::panic::catch_unwind` as a first mitigation, but that alone
+    could not catch this: it was not a Rust panic. The actual cause was
+    `rfd::FileDialog::save_file()` being called inline, synchronously,
+    from that same per-frame callback, which runs on the main thread.
+    `rfd`'s blocking dialog functions show their native panel by
+    dispatching onto the OS main thread and blocking the calling thread
+    until it is dismissed; on macOS that dispatch is a `dispatch_sync`
+    onto the main queue, so calling it from a callback that is *itself*
+    running on the main queue makes that dispatch target the queue
+    already running it, a guaranteed GCD deadlock (which a host can
+    surface as a hang or an outright abort, not a catchable Rust
+    panic). `crates/composer-plugin/src/dialog.rs` now runs the file
+    dialog, for both "Load .mid..." and "Save as .mid...", on a plain
+    spawned background thread instead, polled from the editor callback
+    the same way a background generation result already is. The
+    `catch_unwind` guard stays in place as a safety net for other bugs,
+    but is no longer what this particular crash depends on.
 - [x] As a secondary feature, also send the clip as live MIDI output
       events, for hosts that support live MIDI from a plugin.
   - The clip loops, synced to the host's own transport position when

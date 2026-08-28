@@ -186,10 +186,14 @@ impl EditorState {
 ///
 /// `generation_pending` disables the "Generate" button, so the user
 /// cannot start a second request while one is already running.
+/// `dialog_pending` similarly disables "Load .mid..." and "Save as
+/// .mid..." while a native file dialog is already open, so the user
+/// cannot start a second one before the first is dismissed.
 pub fn draw(
     ctx: &egui::Context,
     state: &mut EditorState,
     generation_pending: bool,
+    dialog_pending: bool,
 ) -> Vec<UiAction> {
     let mut actions = Vec::new();
 
@@ -329,10 +333,14 @@ pub fn draw(
                 );
                 ui.horizontal(|ui| {
                     let load_button = egui::Button::new("Load .mid...");
-                    if ui.add_enabled(!generation_pending, load_button).clicked() {
+                    if ui
+                        .add_enabled(!generation_pending && !dialog_pending, load_button)
+                        .clicked()
+                    {
                         actions.push(UiAction::LoadMidFile);
                     }
-                    if ui.button("Save as .mid...").clicked() {
+                    let save_button = egui::Button::new("Save as .mid...");
+                    if ui.add_enabled(!dialog_pending, save_button).clicked() {
                         actions.push(UiAction::Save);
                     }
                 });
