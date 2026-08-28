@@ -295,6 +295,29 @@ support.
   - "Save as .mid" is the supported way to get the clip out of the
     plugin for now. Revisit this once a maintainer can test it against
     a real DAW on both platforms.
+- [ ] Add a "Copy MIDI" button: copy the generated clip to the OS
+      clipboard, as an alternative to "Save as .mid" plus a manual file
+      drag.
+  - The idea: the user presses the button, then pastes (Cmd+V /
+    Ctrl+V) directly into a DAW track, without a save dialog or a file
+    on disk in between.
+  - Not started. Open questions to resolve before implementing:
+    - Which clipboard data format(s) a real DAW's track or arrangement
+      view actually accepts a pasted MIDI clip from. Standard MIDI
+      file bytes on the general clipboard is the obvious first guess,
+      but this is unconfirmed for Ableton Live, Bitwig, Reaper, or any
+      other host; some hosts may only accept their own internal
+      clipboard format, in which case this would not work at all.
+      Test this by hand once a DAW is available, the same way the
+      live-MIDI-output path already needs a real host-matrix test
+      (see the item above).
+    - Which crate provides cross-platform clipboard access from inside
+      a plugin window (for example `arboard` or `copypasta`), and
+      whether it works correctly from `nih_plug_egui`'s windowing
+      backend on both Linux and macOS.
+    - Whether writing to the shared OS clipboard from a plugin has any
+      surprising side effect on the host or other applications (for
+      example, overwriting something the user just copied elsewhere).
 - [x] Add a "Save as .mid" button, so the user can export the clip as a
       file, for DAWs or workflows that do not support dragging a clip
       out of a plugin window.
