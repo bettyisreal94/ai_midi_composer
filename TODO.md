@@ -328,6 +328,26 @@ support.
     XDG desktop portal over D-Bus, not GTK 3, so no extra development
     package is needed at build time. See `README.md`'s Requirements
     section for the run-time note.
+  - A maintainer hit a real crash pressing this button in a real DAW
+    for the first time, on macOS. The editor's whole per-frame callback
+    (in `crates/composer-plugin/src/lib.rs`) was already wrapped in
+    `std::panic::catch_unwind` as a first mitigation, but that alone
+    could not catch this: it was not a Rust panic. The actual cause was
+    `rfd::FileDialog::save_file()` being called inline, synchronously,
+    from that same per-frame callback, which runs on the main thread.
+    `rfd`'s blocking dialog functions show their native panel by
+    dispatching onto the OS main thread and blocking the calling thread
+    until it is dismissed; on macOS that dispatch is a `dispatch_sync`
+    onto the main queue, so calling it from a callback that is *itself*
+    running on the main queue makes that dispatch target the queue
+    already running it, a guaranteed GCD deadlock (which a host can
+    surface as a hang or an outright abort, not a catchable Rust
+    panic). `crates/composer-plugin/src/dialog.rs` now runs the file
+    dialog, for both "Load .mid..." and "Save as .mid...", on a plain
+    spawned background thread instead, polled from the editor callback
+    the same way a background generation result already is. The
+    `catch_unwind` guard stays in place as a safety net for other bugs,
+    but is no longer what this particular crash depends on.
 - [x] As a secondary feature, also send the clip as live MIDI output
       events, for hosts that support live MIDI from a plugin.
   - The clip loops, synced to the host's own transport position when
@@ -455,6 +475,19 @@ fixed here, ahead of Phase 4, since Phase 4 builds directly on both:
       bound.
   - `composer_ui::draw()` puts it in a scrolling area with a fixed
     maximum height.
+  - This fixed the note list's own height, but not the page as a
+    whole: a maintainer, testing in a real DAW for the first time,
+    found that the editor's fixed window size (`EguiState::from_size`
+    in `composer-plugin`) was too small for everything below the note
+    list to fit. "Save as .mid..." could end up below the visible
+    area, with no way to scroll down to it, since nothing wrapped the
+    page itself in a scroll area, only the note list. Fixed by
+    wrapping the whole page in `egui::ScrollArea::vertical()`, so every
+    button stays reachable by scrolling no matter how tall the content
+    above it grows, and by making the default window size larger
+    (420x560, was 360x320), so scrolling is rarely needed for normal
+    use. This is the kind of bug automated tests cannot catch, since
+    they never render a layout; only real, visual testing found it.
 
 ### Phase 4 — AI provider clients
 

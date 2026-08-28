@@ -9,7 +9,7 @@
 //! `composer_core::generate_clip`, a real call to whichever provider the
 //! settings panel is configured for, and a freshly generated clip
 //! replaces the live-playing demo clip, through [`clip_publisher`].
-//! Phase 6 added "Load .mid..." ([`load_clip_from_file`]) and "Vary
+//! Phase 6 added "Load .mid..." (`dialog::load_clip_from_file`) and "Vary
 //! current clip" (`composer_core::generate_variation`, through the same
 //! `GenerationStore`), so a loaded file and a generated variation both
 //! reach the editor, the save path, and live playback the same way a
@@ -21,14 +21,15 @@
 
 mod background;
 mod clip_publisher;
+mod dialog;
 mod scheduler;
 mod settings;
 
-use std::io::Read;
 use std::sync::Arc;
 
 use background::{GenerateTask, GenerationStore, ProviderConfig};
 use clip_publisher::{ClipPublisher, ClipReader};
+use dialog::DialogStore;
 use composer_core::midi::{MidiClip, Note, TimeSignature, DEFAULT_TICKS_PER_QUARTER};
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, EguiState};
@@ -83,12 +84,27 @@ fn demo_clip() -> MidiClip {
 struct PluginEditorState {
     ui: composer_ui::EditorState,
     pending_request_id: Option<background::RequestId>,
+    /// The in-flight "Load .mid..." or "Save as .mid..." dialog, if
+    /// any. See `dialog` for why these run on a spawned thread rather
+    /// than inline in this callback.
+    pending_dialog: Option<PendingDialog>,
+}
+
+/// Which kind of dialog `PluginEditorState::pending_dialog` is waiting
+/// on, and its request ID to poll `DialogStore` with.
+#[derive(Clone, Copy)]
+enum PendingDialog {
+    Save(dialog::RequestId),
+    Load(dialog::RequestId),
 }
 
 struct ComposerPlugin {
     params: Arc<ComposerPluginParams>,
     egui_state: Arc<EguiState>,
     generation_store: GenerationStore,
+    /// The editor's side of the "Load .mid..." / "Save as .mid..."
+    /// hand-off to a spawned background thread. See `dialog`.
+    dialog_store: DialogStore,
     /// The editor's, and the background task executor's, side of the
     /// live-playback clip handoff. See `clip_publisher` for why this
     /// is a triple buffer, not a plain `MidiClip` field.
@@ -128,8 +144,17 @@ impl Default for ComposerPlugin {
         let (clip_publisher, clip_reader) = ClipPublisher::new(demo_clip());
         Self {
             params: Arc::new(ComposerPluginParams::default()),
-            egui_state: EguiState::from_size(360, 320),
+            // A maintainer found the previous size (360x320) too small
+            // for this editor's own content: the "Save as .mid..."
+            // button could end up below the visible area, with no way
+            // to scroll to it. `composer_ui::draw()` now wraps the
+            // whole page in a scroll area as the real fix, so every
+            // button stays reachable regardless of window size; this
+            // larger size just means that is rarely needed in normal
+            // use.
+            egui_state: EguiState::from_size(420, 560),
             generation_store: GenerationStore::default(),
+            dialog_store: DialogStore::default(),
             clip_publisher,
             clip_reader,
             last_seen_generation: 0,
@@ -176,6 +201,7 @@ impl Plugin for ComposerPlugin {
 
     fn editor(&mut self, async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let generation_store = self.generation_store.clone();
+        let dialog_store = self.dialog_store.clone();
         let clip_publisher = self.clip_publisher.clone();
 
         let mut ui_state = composer_ui::EditorState::new(demo_clip());
@@ -201,73 +227,122 @@ impl Plugin for ComposerPlugin {
             PluginEditorState {
                 ui: ui_state,
                 pending_request_id: None,
+                pending_dialog: None,
             },
             |_, _| {},
             move |ctx, _setter, state| {
-                // Check for a finished background generation before
-                // drawing, so this frame already shows the result.
-                if let Some(id) = state.pending_request_id {
-                    if let Some(result) = generation_store.poll(id) {
-                        state.pending_request_id = None;
-                        match result {
-                            Ok(clip) => {
-                                state.ui.status_message =
-                                    format!("Generated {} notes.", clip.notes.len());
-                                // Send the new clip to the audio thread
-                                // for live playback, and show it in the
-                                // editor for saving. See
-                                // `clip_publisher` for why this is not
-                                // a plain assignment shared with the
-                                // audio thread.
-                                clip_publisher.publish(clip.clone());
-                                state.ui.clip = clip;
-                                state.ui.status = composer_ui::GenerationStatus::Done;
-                            }
-                            Err(message) => {
-                                state.ui.error_detail = Some(message.clone());
-                                state.ui.status_message = message;
-                                state.ui.status = composer_ui::GenerationStatus::Error;
+                // A maintainer hit a real crash pressing "Save as
+                // .mid..." on macOS: `rfd`'s blocking file dialog was
+                // being called inline, right here, which deadlocked
+                // (see `dialog`'s module docs for why). `dialog` now
+                // runs that off this callback entirely, on a spawned
+                // thread, which is the actual fix for that crash. This
+                // `catch_unwind` stays anyway, as a safety net for any
+                // other bug in this callback: a Rust panic that unwinds
+                // out of a callback the host calls into (this one,
+                // called every frame by `nih_plug_egui`) crosses back
+                // into the host's own C/C++ code as it unwinds, which
+                // is undefined behavior, and in practice usually aborts
+                // the whole host process, not just this plugin.
+                // Catching the panic here, at the outermost point in
+                // this callback, turns a real bug into a normal,
+                // visible error instead of a crash. This only catches
+                // genuine Rust panics (a bug in this project's own
+                // code, or in a dependency); it cannot catch a native
+                // crash that never goes through Rust's own panic
+                // mechanism at all (for example a segfault, or an
+                // uncaught Objective-C exception on macOS, which is
+                // what the deadlock above could also surface as,
+                // depending on the host).
+                let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Check for a finished background generation before
+                    // drawing, so this frame already shows the result.
+                    if let Some(id) = state.pending_request_id {
+                        if let Some(result) = generation_store.poll(id) {
+                            state.pending_request_id = None;
+                            match result {
+                                Ok(clip) => {
+                                    state.ui.status_message =
+                                        format!("Generated {} notes.", clip.notes.len());
+                                    // Send the new clip to the audio thread
+                                    // for live playback, and show it in the
+                                    // editor for saving. See
+                                    // `clip_publisher` for why this is not
+                                    // a plain assignment shared with the
+                                    // audio thread.
+                                    clip_publisher.publish(clip.clone());
+                                    state.ui.clip = clip;
+                                    state.ui.status = composer_ui::GenerationStatus::Done;
+                                }
+                                Err(message) => {
+                                    state.ui.error_detail = Some(message.clone());
+                                    state.ui.status_message = message;
+                                    state.ui.status = composer_ui::GenerationStatus::Error;
+                                }
                             }
                         }
                     }
-                }
 
-                let pending = state.pending_request_id.is_some();
-                let actions = composer_ui::draw(ctx, &mut state.ui, pending);
-
-                for action in actions {
-                    match action {
-                        composer_ui::UiAction::Generate => {
-                            // Ignore extra clicks while a request is
-                            // already running. `composer_ui::draw` also
-                            // disables the button for this, so this
-                            // check only matters if a click was
-                            // already queued the instant before that
-                            // happened.
-                            if state.pending_request_id.is_none() {
-                                let config = ProviderConfig::from(&state.ui.settings);
-                                let id =
-                                    generation_store.submit(state.ui.prompt.clone(), config, None);
-                                state.pending_request_id = Some(id);
-                                state.ui.status = composer_ui::GenerationStatus::Working;
-                                state.ui.status_message.clear();
-                                async_executor.execute_background(GenerateTask(id));
+                    // Check for a finished dialog before drawing, the
+                    // same way as a finished background generation
+                    // above.
+                    if let Some(pending_dialog) = state.pending_dialog {
+                        match pending_dialog {
+                            PendingDialog::Save(id) => {
+                                if let Some(result) = dialog_store.poll_save(id) {
+                                    state.pending_dialog = None;
+                                    if let Err(message) = &result {
+                                        state.ui.error_detail = Some(message.clone());
+                                    }
+                                    state.ui.save_message = Some(result);
+                                }
+                            }
+                            PendingDialog::Load(id) => {
+                                if let Some(result) = dialog_store.poll_load(id) {
+                                    state.pending_dialog = None;
+                                    match result {
+                                        Ok(Some(clip)) => {
+                                            state.ui.status_message = format!(
+                                                "Loaded {} notes from file.",
+                                                clip.notes.len()
+                                            );
+                                            clip_publisher.publish(clip.clone());
+                                            state.ui.clip = clip;
+                                            state.ui.status = composer_ui::GenerationStatus::Done;
+                                        }
+                                        Ok(None) => {
+                                            // The user cancelled the file picker.
+                                        }
+                                        Err(message) => {
+                                            state.ui.error_detail = Some(message.clone());
+                                            state.ui.status_message = message;
+                                            state.ui.status = composer_ui::GenerationStatus::Error;
+                                        }
+                                    }
+                                }
                             }
                         }
-                        composer_ui::UiAction::GenerateVariation => {
-                            if state.pending_request_id.is_none() {
-                                if state.ui.prompt.trim().is_empty() {
-                                    state.ui.error_detail =
-                                        Some("Type an instruction first.".to_string());
-                                    state.ui.status_message =
-                                        "Type an instruction first.".to_string();
-                                    state.ui.status = composer_ui::GenerationStatus::Error;
-                                } else {
+                    }
+
+                    let pending = state.pending_request_id.is_some();
+                    let dialog_pending = state.pending_dialog.is_some();
+                    let actions = composer_ui::draw(ctx, &mut state.ui, pending, dialog_pending);
+
+                    for action in actions {
+                        match action {
+                            composer_ui::UiAction::Generate => {
+                                // Ignore extra clicks while a request is
+                                // already running. `composer_ui::draw` also
+                                // disables the button for this, so this
+                                // check only matters if a click was
+                                // already queued the instant before that
+                                // happened.
+                                if state.pending_request_id.is_none() {
                                     let config = ProviderConfig::from(&state.ui.settings);
                                     let id = generation_store.submit(
                                         state.ui.prompt.clone(),
                                         config,
-                                        Some(state.ui.clip.clone()),
+                                        None,
                                     );
                                     state.pending_request_id = Some(id);
                                     state.ui.status = composer_ui::GenerationStatus::Working;
@@ -275,95 +350,124 @@ impl Plugin for ComposerPlugin {
                                     async_executor.execute_background(GenerateTask(id));
                                 }
                             }
-                        }
-                        composer_ui::UiAction::LoadMidFile => match load_clip_from_file() {
-                            Ok(Some(clip)) => {
-                                state.ui.status_message =
-                                    format!("Loaded {} notes from file.", clip.notes.len());
-                                clip_publisher.publish(clip.clone());
-                                state.ui.clip = clip;
-                                state.ui.status = composer_ui::GenerationStatus::Done;
-                            }
-                            Ok(None) => {
-                                // The user cancelled the file picker.
-                            }
-                            Err(message) => {
-                                state.ui.error_detail = Some(message.clone());
-                                state.ui.status_message = message;
-                                state.ui.status = composer_ui::GenerationStatus::Error;
-                            }
-                        },
-                        composer_ui::UiAction::Save => {
-                            let result = save_clip_to_file(&state.ui.clip);
-                            if let Err(message) = &result {
-                                state.ui.error_detail = Some(message.clone());
-                            }
-                            state.ui.save_message = Some(result);
-                        }
-                        composer_ui::UiAction::ProviderKindChanged => {
-                            // Show whatever key is already saved for
-                            // the newly picked provider, instead of
-                            // leaving the previous provider's key
-                            // visible under the wrong provider. The
-                            // base URL must be updated first: the
-                            // keychain entry is keyed on (kind,
-                            // base_url), not on kind alone, so each
-                            // OpenAI-compatible service (OpenAI,
-                            // DeepSeek, OpenRouter, a local server, ...)
-                            // can keep its own separate key.
-                            let defaults =
-                                composer_ui::ProviderSettings::defaults_for(state.ui.settings.kind);
-                            state.ui.settings.base_url = defaults.base_url;
-                            state.ui.settings.model = defaults.model;
-                            state.ui.settings_message = match settings::load_api_key(
-                                state.ui.settings.kind,
-                                &state.ui.settings.base_url,
-                            ) {
-                                Ok(api_key) => {
-                                    state.ui.settings.api_key = api_key;
-                                    None
+                            composer_ui::UiAction::GenerateVariation => {
+                                if state.pending_request_id.is_none() {
+                                    if state.ui.prompt.trim().is_empty() {
+                                        state.ui.error_detail =
+                                            Some("Type an instruction first.".to_string());
+                                        state.ui.status_message =
+                                            "Type an instruction first.".to_string();
+                                        state.ui.status = composer_ui::GenerationStatus::Error;
+                                    } else {
+                                        let config = ProviderConfig::from(&state.ui.settings);
+                                        let id = generation_store.submit(
+                                            state.ui.prompt.clone(),
+                                            config,
+                                            Some(state.ui.clip.clone()),
+                                        );
+                                        state.pending_request_id = Some(id);
+                                        state.ui.status = composer_ui::GenerationStatus::Working;
+                                        state.ui.status_message.clear();
+                                        async_executor.execute_background(GenerateTask(id));
+                                    }
                                 }
-                                Err(message) => {
-                                    state.ui.settings.api_key = String::new();
-                                    let full_message =
-                                        format!("could not read the saved API key: {message}");
-                                    state.ui.error_detail = Some(full_message.clone());
-                                    Some(Err(full_message))
+                            }
+                            composer_ui::UiAction::LoadMidFile => {
+                                // `composer_ui::draw` already disables
+                                // this button while a dialog is
+                                // pending; this check only matters if a
+                                // click was already queued the instant
+                                // before that happened.
+                                if state.pending_dialog.is_none() {
+                                    let id = dialog_store.submit_load();
+                                    state.pending_dialog = Some(PendingDialog::Load(id));
                                 }
-                            };
-                        }
-                        composer_ui::UiAction::SaveApiKey => {
-                            let key_result = settings::save_api_key(
-                                state.ui.settings.kind,
-                                &state.ui.settings.base_url,
-                                &state.ui.settings.api_key,
-                            );
-                            // Also persist the non-secret settings
-                            // (kind, base URL, model) alongside the key,
-                            // so they survive a plugin restart too. Best
-                            // effort: a failure here should not hide
-                            // that the API key itself did save.
-                            if key_result.is_ok() {
-                                let _ = settings::save_persisted_settings(&state.ui.settings);
                             }
-                            if let Err(message) = &key_result {
-                                state.ui.error_detail = Some(message.clone());
+                            composer_ui::UiAction::Save => {
+                                if state.pending_dialog.is_none() {
+                                    let id = dialog_store.submit_save(state.ui.clip.clone());
+                                    state.pending_dialog = Some(PendingDialog::Save(id));
+                                }
                             }
-                            state.ui.settings_message = Some(key_result);
-                        }
-                        composer_ui::UiAction::CopyErrorToClipboard => {
-                            // `composer-ui` has no OS dependency (see
-                            // its module docs), so it only reports that
-                            // the button was pressed; this is the one
-                            // place that actually reaches the OS
-                            // clipboard, through `arboard`, which talks
-                            // to the OS directly and does not depend on
-                            // `nih_plug_egui`'s own windowing backend
-                            // having clipboard support.
-                            let text = state.ui.error_detail.clone().unwrap_or_default();
-                            state.ui.clipboard_message = Some(copy_to_clipboard(&text));
+                            composer_ui::UiAction::ProviderKindChanged => {
+                                // Show whatever key is already saved for
+                                // the newly picked provider, instead of
+                                // leaving the previous provider's key
+                                // visible under the wrong provider. The
+                                // base URL must be updated first: the
+                                // keychain entry is keyed on (kind,
+                                // base_url), not on kind alone, so each
+                                // OpenAI-compatible service (OpenAI,
+                                // DeepSeek, OpenRouter, a local server, ...)
+                                // can keep its own separate key.
+                                let defaults = composer_ui::ProviderSettings::defaults_for(
+                                    state.ui.settings.kind,
+                                );
+                                state.ui.settings.base_url = defaults.base_url;
+                                state.ui.settings.model = defaults.model;
+                                state.ui.settings_message = match settings::load_api_key(
+                                    state.ui.settings.kind,
+                                    &state.ui.settings.base_url,
+                                ) {
+                                    Ok(api_key) => {
+                                        state.ui.settings.api_key = api_key;
+                                        None
+                                    }
+                                    Err(message) => {
+                                        state.ui.settings.api_key = String::new();
+                                        let full_message =
+                                            format!("could not read the saved API key: {message}");
+                                        state.ui.error_detail = Some(full_message.clone());
+                                        Some(Err(full_message))
+                                    }
+                                };
+                            }
+                            composer_ui::UiAction::SaveApiKey => {
+                                let key_result = settings::save_api_key(
+                                    state.ui.settings.kind,
+                                    &state.ui.settings.base_url,
+                                    &state.ui.settings.api_key,
+                                );
+                                // Also persist the non-secret settings
+                                // (kind, base URL, model) alongside the key,
+                                // so they survive a plugin restart too. Best
+                                // effort: a failure here should not hide
+                                // that the API key itself did save.
+                                if key_result.is_ok() {
+                                    let _ = settings::save_persisted_settings(&state.ui.settings);
+                                }
+                                if let Err(message) = &key_result {
+                                    state.ui.error_detail = Some(message.clone());
+                                }
+                                state.ui.settings_message = Some(key_result);
+                            }
+                            composer_ui::UiAction::CopyErrorToClipboard => {
+                                // `composer-ui` has no OS dependency (see
+                                // its module docs), so it only reports that
+                                // the button was pressed; this is the one
+                                // place that actually reaches the OS
+                                // clipboard, through `arboard`, which talks
+                                // to the OS directly and does not depend on
+                                // `nih_plug_egui`'s own windowing backend
+                                // having clipboard support.
+                                let text = state.ui.error_detail.clone().unwrap_or_default();
+                                state.ui.clipboard_message = Some(copy_to_clipboard(&text));
+                            }
                         }
                     }
+                }));
+
+                if let Err(panic_payload) = panic_result {
+                    let message = format!(
+                        "An internal error happened and was caught before it could crash the \
+                         host: {}",
+                        describe_panic_payload(&panic_payload)
+                    );
+                    state.pending_request_id = None;
+                    state.pending_dialog = None;
+                    state.ui.error_detail = Some(message.clone());
+                    state.ui.status_message = message;
+                    state.ui.status = composer_ui::GenerationStatus::Error;
                 }
             },
         )
@@ -533,6 +637,24 @@ fn emit_event(context: &mut impl ProcessContext<ComposerPlugin>, event: schedule
     context.send_event(note_event);
 }
 
+/// Turns a caught panic's payload (from `std::panic::catch_unwind`)
+/// into readable text. A panic payload is `Box<dyn Any + Send>`; in
+/// practice it is almost always the message passed to `panic!()`, as
+/// either a `&'static str` (a plain `panic!("literal")`) or a `String`
+/// (anything built with `format!()`, including what `.expect()` and a
+/// failed `assert!()` produce), so those two cases cover what a user
+/// will actually see. Anything else falls back to a fixed message,
+/// rather than failing to report the panic at all.
+fn describe_panic_payload(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message.to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "no further details are available for this panic".to_string()
+    }
+}
+
 /// Writes `text` to the OS clipboard, using `arboard`, which talks to
 /// the OS clipboard directly. This does not depend on
 /// `nih_plug_egui`'s own windowing backend (`egui-baseview`) having its
@@ -551,85 +673,6 @@ fn copy_to_clipboard(text: &str) -> Result<String, String> {
         .set_text(text.to_string())
         .map_err(|err| format!("could not copy to the clipboard: {err}"))?;
     Ok("Copied to clipboard.".to_string())
-}
-
-/// Opens a native "save file" dialog, and writes `clip` to the chosen
-/// path as a standard MIDI file. Returns a short message describing
-/// what happened, so the editor can show it. Returns `Ok` with an
-/// empty message if the user cancels the dialog, since that is not a
-/// failure.
-fn save_clip_to_file(clip: &MidiClip) -> Result<String, String> {
-    let Some(path) = rfd::FileDialog::new()
-        .add_filter("MIDI file", &["mid", "midi"])
-        .set_file_name("ai-midi-composer-demo.mid")
-        .save_file()
-    else {
-        return Ok(String::new());
-    };
-
-    let bytes = clip
-        .to_smf_bytes()
-        .map_err(|err| format!("could not encode the clip as MIDI: {err}"))?;
-    std::fs::write(&path, bytes)
-        .map_err(|err| format!("could not write {}: {err}", path.display()))?;
-    Ok(format!("Saved to {}.", path.display()))
-}
-
-/// A chosen file larger than this is rejected outright, before its
-/// bytes are even read into memory. A real MIDI file worth importing is
-/// at most a few hundred kilobytes; this is generous headroom above
-/// that. A review found that the load path read a whole chosen file
-/// with no limit at all, on the UI thread, which meant an accidental or
-/// hostile multi-gigabyte file could stall the editor and exhaust
-/// memory. This does not move the read itself off the UI thread (a
-/// picked file is normally small enough that the read is fast; see
-/// `TODO.md` for why the bigger move-to-a-background-task change is
-/// tracked separately), but it does stop an oversized file from ever
-/// being read into memory in the first place.
-const MAX_MIDI_FILE_BYTES: u64 = 5_000_000;
-
-/// Opens a native "open file" dialog, and reads the chosen path as a
-/// standard MIDI file, using the Phase 1 code
-/// (`MidiClip::from_smf_bytes`). Returns `Ok(None)` if the user cancels
-/// the dialog, since that is not a failure.
-fn load_clip_from_file() -> Result<Option<MidiClip>, String> {
-    let Some(path) = rfd::FileDialog::new()
-        .add_filter("MIDI file", &["mid", "midi"])
-        .pick_file()
-    else {
-        return Ok(None);
-    };
-
-    let metadata = std::fs::metadata(&path)
-        .map_err(|err| format!("could not read {}: {err}", path.display()))?;
-    if metadata.len() > MAX_MIDI_FILE_BYTES {
-        return Err(format!(
-            "{} is {} bytes; the limit for a MIDI file is {MAX_MIDI_FILE_BYTES} bytes",
-            path.display(),
-            metadata.len()
-        ));
-    }
-
-    // Bound the actual read too, not just the metadata check: a file
-    // can grow between the check above and this read, and a special
-    // file (for example a named pipe) can report a misleading size, or
-    // none at all.
-    let file = std::fs::File::open(&path)
-        .map_err(|err| format!("could not read {}: {err}", path.display()))?;
-    let mut bytes = Vec::new();
-    file.take(MAX_MIDI_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|err| format!("could not read {}: {err}", path.display()))?;
-    if bytes.len() as u64 > MAX_MIDI_FILE_BYTES {
-        return Err(format!(
-            "{} is larger than the {MAX_MIDI_FILE_BYTES}-byte limit",
-            path.display()
-        ));
-    }
-
-    let clip = MidiClip::from_smf_bytes(&bytes)
-        .map_err(|err| format!("could not read {} as MIDI: {err}", path.display()))?;
-    Ok(Some(clip))
 }
 
 impl ClapPlugin for ComposerPlugin {

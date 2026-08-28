@@ -186,54 +186,165 @@ impl EditorState {
 ///
 /// `generation_pending` disables the "Generate" button, so the user
 /// cannot start a second request while one is already running.
+/// `dialog_pending` similarly disables "Load .mid..." and "Save as
+/// .mid..." while a native file dialog is already open, so the user
+/// cannot start a second one before the first is dismissed.
 pub fn draw(
     ctx: &egui::Context,
     state: &mut EditorState,
     generation_pending: bool,
+    dialog_pending: bool,
 ) -> Vec<UiAction> {
     let mut actions = Vec::new();
 
     egui::CentralPanel::default().show(ctx, |ui| {
-        ui.heading("AI MIDI Composer (dev)");
-        ui.label(
-            "\"Generate\" makes a new clip from the prompt below. \"Vary \
+        // A maintainer found that this window's fixed size
+        // (`EguiState::from_size` in `composer-plugin`) was too small
+        // for everything below to fit: with the provider settings
+        // panel, the prompt box, the note list, and the instructions
+        // text all present, the "Save as .mid..." button could end up
+        // below the visible area, with no way to reach it, since only
+        // the note list below had its own scroll area, not the page as
+        // a whole. Wrapping the whole page in one guarantees every
+        // button stays reachable by scrolling, regardless of how tall
+        // the content above it grows (a long status or error message,
+        // a long note list, a taller host-imposed window size, ...),
+        // instead of depending on a fixed window size happening to be
+        // tall enough.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.heading("AI MIDI Composer (dev)");
+                ui.label(
+                    "\"Generate\" makes a new clip from the prompt below. \"Vary \
              current clip\" changes the loaded clip by the prompt's \
              instruction instead, such as \"add a harmony line\".",
-        );
-        ui.separator();
+                );
+                ui.separator();
 
-        egui::CollapsingHeader::new("Provider settings")
-            .default_open(false)
-            .show(ui, |ui| {
-                let previous_kind = state.settings.kind;
-                egui::ComboBox::from_label("Provider")
-                    .selected_text(state.settings.kind.label())
-                    .show_ui(ui, |ui| {
-                        for kind in ProviderKind::ALL {
-                            ui.selectable_value(&mut state.settings.kind, kind, kind.label());
+                egui::CollapsingHeader::new("Provider settings")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        let previous_kind = state.settings.kind;
+                        egui::ComboBox::from_label("Provider")
+                            .selected_text(state.settings.kind.label())
+                            .show_ui(ui, |ui| {
+                                for kind in ProviderKind::ALL {
+                                    ui.selectable_value(
+                                        &mut state.settings.kind,
+                                        kind,
+                                        kind.label(),
+                                    );
+                                }
+                            });
+                        if state.settings.kind != previous_kind {
+                            actions.push(UiAction::ProviderKindChanged);
+                        }
+
+                        ui.horizontal(|ui| {
+                            ui.label("Base URL:");
+                            ui.text_edit_singleline(&mut state.settings.base_url);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Model:");
+                            ui.text_edit_singleline(&mut state.settings.model);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("API key:");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut state.settings.api_key)
+                                    .password(true),
+                            );
+                        });
+
+                        if ui.button("Save API key").clicked() {
+                            actions.push(UiAction::SaveApiKey);
+                        }
+                        match &state.settings_message {
+                            Some(Ok(message)) => {
+                                ui.colored_label(egui::Color32::GREEN, message);
+                            }
+                            Some(Err(message)) => {
+                                ui.colored_label(egui::Color32::RED, message);
+                            }
+                            None => {}
                         }
                     });
-                if state.settings.kind != previous_kind {
-                    actions.push(UiAction::ProviderKindChanged);
-                }
+
+                ui.separator();
+
+                ui.label("Prompt:");
+                ui.text_edit_multiline(&mut state.prompt);
 
                 ui.horizontal(|ui| {
-                    ui.label("Base URL:");
-                    ui.text_edit_singleline(&mut state.settings.base_url);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Model:");
-                    ui.text_edit_singleline(&mut state.settings.model);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("API key:");
-                    ui.add(egui::TextEdit::singleline(&mut state.settings.api_key).password(true));
+                    let generate_button = egui::Button::new("Generate");
+                    if ui
+                        .add_enabled(!generation_pending, generate_button)
+                        .clicked()
+                    {
+                        actions.push(UiAction::Generate);
+                    }
+
+                    let vary_button = egui::Button::new("Vary current clip");
+                    if ui.add_enabled(!generation_pending, vary_button).clicked() {
+                        actions.push(UiAction::GenerateVariation);
+                    }
+
+                    let (label, color) = match state.status {
+                        GenerationStatus::Idle => ("idle".to_string(), egui::Color32::GRAY),
+                        GenerationStatus::Working => {
+                            ("working…".to_string(), egui::Color32::YELLOW)
+                        }
+                        GenerationStatus::Done => {
+                            (state.status_message.clone(), egui::Color32::GREEN)
+                        }
+                        GenerationStatus::Error => {
+                            (state.status_message.clone(), egui::Color32::RED)
+                        }
+                    };
+                    ui.colored_label(color, label);
                 });
 
-                if ui.button("Save API key").clicked() {
-                    actions.push(UiAction::SaveApiKey);
-                }
-                match &state.settings_message {
+                ui.separator();
+                ui.label(format!(
+                    "Loaded clip: {} notes, {} BPM.",
+                    state.clip.notes.len(),
+                    state.clip.tempo_bpm as u32,
+                ));
+                // A generated clip could have many notes. Keep the window a
+                // fixed size by scrolling the note list, instead of growing
+                // the window or spilling past its edge.
+                egui::ScrollArea::vertical()
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        for note in &state.clip.notes {
+                            ui.label(format!(
+                                "  pitch {} · velocity {} · start tick {}",
+                                note.pitch, note.velocity, note.start
+                            ));
+                        }
+                    });
+
+                ui.separator();
+                ui.label(
+                    "There is no drag-and-drop into or out of this window yet. \
+             Use \"Load .mid...\" to open a file, and \"Save as .mid\" \
+             then drag the saved file into your DAW.",
+                );
+                ui.horizontal(|ui| {
+                    let load_button = egui::Button::new("Load .mid...");
+                    if ui
+                        .add_enabled(!generation_pending && !dialog_pending, load_button)
+                        .clicked()
+                    {
+                        actions.push(UiAction::LoadMidFile);
+                    }
+                    let save_button = egui::Button::new("Save as .mid...");
+                    if ui.add_enabled(!dialog_pending, save_button).clicked() {
+                        actions.push(UiAction::Save);
+                    }
+                });
+                match &state.save_message {
                     Some(Ok(message)) => {
                         ui.colored_label(egui::Color32::GREEN, message);
                     }
@@ -243,79 +354,6 @@ pub fn draw(
                     None => {}
                 }
             });
-
-        ui.separator();
-
-        ui.label("Prompt:");
-        ui.text_edit_multiline(&mut state.prompt);
-
-        ui.horizontal(|ui| {
-            let generate_button = egui::Button::new("Generate");
-            if ui
-                .add_enabled(!generation_pending, generate_button)
-                .clicked()
-            {
-                actions.push(UiAction::Generate);
-            }
-
-            let vary_button = egui::Button::new("Vary current clip");
-            if ui.add_enabled(!generation_pending, vary_button).clicked() {
-                actions.push(UiAction::GenerateVariation);
-            }
-
-            let (label, color) = match state.status {
-                GenerationStatus::Idle => ("idle".to_string(), egui::Color32::GRAY),
-                GenerationStatus::Working => ("working…".to_string(), egui::Color32::YELLOW),
-                GenerationStatus::Done => (state.status_message.clone(), egui::Color32::GREEN),
-                GenerationStatus::Error => (state.status_message.clone(), egui::Color32::RED),
-            };
-            ui.colored_label(color, label);
-        });
-
-        ui.separator();
-        ui.label(format!(
-            "Loaded clip: {} notes, {} BPM.",
-            state.clip.notes.len(),
-            state.clip.tempo_bpm as u32,
-        ));
-        // A generated clip could have many notes. Keep the window a
-        // fixed size by scrolling the note list, instead of growing
-        // the window or spilling past its edge.
-        egui::ScrollArea::vertical()
-            .max_height(120.0)
-            .show(ui, |ui| {
-                for note in &state.clip.notes {
-                    ui.label(format!(
-                        "  pitch {} · velocity {} · start tick {}",
-                        note.pitch, note.velocity, note.start
-                    ));
-                }
-            });
-
-        ui.separator();
-        ui.label(
-            "There is no drag-and-drop into or out of this window yet. \
-             Use \"Load .mid...\" to open a file, and \"Save as .mid\" \
-             then drag the saved file into your DAW.",
-        );
-        ui.horizontal(|ui| {
-            let load_button = egui::Button::new("Load .mid...");
-            if ui.add_enabled(!generation_pending, load_button).clicked() {
-                actions.push(UiAction::LoadMidFile);
-            }
-            if ui.button("Save as .mid...").clicked() {
-                actions.push(UiAction::Save);
-            }
-        });
-        match &state.save_message {
-            Some(Ok(message)) => {
-                ui.colored_label(egui::Color32::GREEN, message);
-            }
-            Some(Err(message)) => {
-                ui.colored_label(egui::Color32::RED, message);
-            }
-            None => {}
-        }
     });
 
     // A separate, dedicated window for the full text of the most recent
