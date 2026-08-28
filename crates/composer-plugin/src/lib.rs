@@ -6,11 +6,11 @@
 //! status label, wired to a stub that always produced the same fixed
 //! clip. Phase 4 added the AI provider clients. Phase 5 connected them
 //! to "Generate": `background::GenerationStore` runs
-//! `agent_core::generate_clip`, a real call to whichever provider the
+//! `composer_core::generate_clip`, a real call to whichever provider the
 //! settings panel is configured for, and a freshly generated clip
 //! replaces the live-playing demo clip, through [`clip_publisher`].
 //! Phase 6 added "Load .mid..." ([`load_clip_from_file`]) and "Vary
-//! current clip" (`agent_core::generate_variation`, through the same
+//! current clip" (`composer_core::generate_variation`, through the same
 //! `GenerationStore`), so a loaded file and a generated variation both
 //! reach the editor, the save path, and live playback the same way a
 //! fresh generation result does.
@@ -27,9 +27,9 @@ mod settings;
 use std::io::Read;
 use std::sync::Arc;
 
-use agent_core::midi::{MidiClip, Note, TimeSignature, DEFAULT_TICKS_PER_QUARTER};
 use background::{GenerateTask, GenerationStore, ProviderConfig};
 use clip_publisher::{ClipPublisher, ClipReader};
+use composer_core::midi::{MidiClip, Note, TimeSignature, DEFAULT_TICKS_PER_QUARTER};
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, EguiState};
 use scheduler::ActiveNotes;
@@ -76,17 +76,17 @@ fn demo_clip() -> MidiClip {
     }
 }
 
-/// The editor's full state: the reusable UI state from `agent-ui`, plus
+/// The editor's full state: the reusable UI state from `composer-ui`, plus
 /// the one piece of bookkeeping that only makes sense on the plugin
 /// side of the crate boundary: which background request, if any, is
-/// still pending. `agent-ui` never sees this field.
+/// still pending. `composer-ui` never sees this field.
 struct PluginEditorState {
-    ui: agent_ui::EditorState,
+    ui: composer_ui::EditorState,
     pending_request_id: Option<background::RequestId>,
 }
 
-struct AgentPlugin {
-    params: Arc<AgentPluginParams>,
+struct ComposerPlugin {
+    params: Arc<ComposerPluginParams>,
     egui_state: Arc<EguiState>,
     generation_store: GenerationStore,
     /// The editor's, and the background task executor's, side of the
@@ -123,11 +123,11 @@ struct AgentPlugin {
     sample_rate: f32,
 }
 
-impl Default for AgentPlugin {
+impl Default for ComposerPlugin {
     fn default() -> Self {
         let (clip_publisher, clip_reader) = ClipPublisher::new(demo_clip());
         Self {
-            params: Arc::new(AgentPluginParams::default()),
+            params: Arc::new(ComposerPluginParams::default()),
             egui_state: EguiState::from_size(360, 320),
             generation_store: GenerationStore::default(),
             clip_publisher,
@@ -143,11 +143,11 @@ impl Default for AgentPlugin {
 }
 
 #[derive(Params, Default)]
-struct AgentPluginParams {}
+struct ComposerPluginParams {}
 
-impl Plugin for AgentPlugin {
-    const NAME: &'static str = "AI MIDI Agent (dev)";
-    const VENDOR: &'static str = "AI MIDI Agent Project";
+impl Plugin for ComposerPlugin {
+    const NAME: &'static str = "AI MIDI Composer (dev)";
+    const VENDOR: &'static str = "AI MIDI Composer Project";
     const URL: &'static str = env!("CARGO_PKG_REPOSITORY");
     const EMAIL: &'static str = "none@example.com";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
@@ -178,7 +178,7 @@ impl Plugin for AgentPlugin {
         let generation_store = self.generation_store.clone();
         let clip_publisher = self.clip_publisher.clone();
 
-        let mut ui_state = agent_ui::EditorState::new(demo_clip());
+        let mut ui_state = composer_ui::EditorState::new(demo_clip());
         // Restore whichever provider kind, base URL, and model the user
         // last saved, so a plugin restart does not reset them to
         // hard-coded defaults. Falls back to the defaults already set
@@ -220,24 +220,24 @@ impl Plugin for AgentPlugin {
                                 // audio thread.
                                 clip_publisher.publish(clip.clone());
                                 state.ui.clip = clip;
-                                state.ui.status = agent_ui::GenerationStatus::Done;
+                                state.ui.status = composer_ui::GenerationStatus::Done;
                             }
                             Err(message) => {
                                 state.ui.status_message = message;
-                                state.ui.status = agent_ui::GenerationStatus::Error;
+                                state.ui.status = composer_ui::GenerationStatus::Error;
                             }
                         }
                     }
                 }
 
                 let pending = state.pending_request_id.is_some();
-                let actions = agent_ui::draw(ctx, &mut state.ui, pending);
+                let actions = composer_ui::draw(ctx, &mut state.ui, pending);
 
                 for action in actions {
                     match action {
-                        agent_ui::UiAction::Generate => {
+                        composer_ui::UiAction::Generate => {
                             // Ignore extra clicks while a request is
-                            // already running. `agent_ui::draw` also
+                            // already running. `composer_ui::draw` also
                             // disables the button for this, so this
                             // check only matters if a click was
                             // already queued the instant before that
@@ -247,17 +247,17 @@ impl Plugin for AgentPlugin {
                                 let id =
                                     generation_store.submit(state.ui.prompt.clone(), config, None);
                                 state.pending_request_id = Some(id);
-                                state.ui.status = agent_ui::GenerationStatus::Working;
+                                state.ui.status = composer_ui::GenerationStatus::Working;
                                 state.ui.status_message.clear();
                                 async_executor.execute_background(GenerateTask(id));
                             }
                         }
-                        agent_ui::UiAction::GenerateVariation => {
+                        composer_ui::UiAction::GenerateVariation => {
                             if state.pending_request_id.is_none() {
                                 if state.ui.prompt.trim().is_empty() {
                                     state.ui.status_message =
                                         "Type an instruction first.".to_string();
-                                    state.ui.status = agent_ui::GenerationStatus::Error;
+                                    state.ui.status = composer_ui::GenerationStatus::Error;
                                 } else {
                                     let config = ProviderConfig::from(&state.ui.settings);
                                     let id = generation_store.submit(
@@ -266,32 +266,32 @@ impl Plugin for AgentPlugin {
                                         Some(state.ui.clip.clone()),
                                     );
                                     state.pending_request_id = Some(id);
-                                    state.ui.status = agent_ui::GenerationStatus::Working;
+                                    state.ui.status = composer_ui::GenerationStatus::Working;
                                     state.ui.status_message.clear();
                                     async_executor.execute_background(GenerateTask(id));
                                 }
                             }
                         }
-                        agent_ui::UiAction::LoadMidFile => match load_clip_from_file() {
+                        composer_ui::UiAction::LoadMidFile => match load_clip_from_file() {
                             Ok(Some(clip)) => {
                                 state.ui.status_message =
                                     format!("Loaded {} notes from file.", clip.notes.len());
                                 clip_publisher.publish(clip.clone());
                                 state.ui.clip = clip;
-                                state.ui.status = agent_ui::GenerationStatus::Done;
+                                state.ui.status = composer_ui::GenerationStatus::Done;
                             }
                             Ok(None) => {
                                 // The user cancelled the file picker.
                             }
                             Err(message) => {
                                 state.ui.status_message = message;
-                                state.ui.status = agent_ui::GenerationStatus::Error;
+                                state.ui.status = composer_ui::GenerationStatus::Error;
                             }
                         },
-                        agent_ui::UiAction::Save => {
+                        composer_ui::UiAction::Save => {
                             state.ui.save_message = Some(save_clip_to_file(&state.ui.clip));
                         }
-                        agent_ui::UiAction::ProviderKindChanged => {
+                        composer_ui::UiAction::ProviderKindChanged => {
                             // Show whatever key is already saved for
                             // the newly picked provider, instead of
                             // leaving the previous provider's key
@@ -303,7 +303,7 @@ impl Plugin for AgentPlugin {
                             // DeepSeek, OpenRouter, a local server, ...)
                             // can keep its own separate key.
                             let defaults =
-                                agent_ui::ProviderSettings::defaults_for(state.ui.settings.kind);
+                                composer_ui::ProviderSettings::defaults_for(state.ui.settings.kind);
                             state.ui.settings.base_url = defaults.base_url;
                             state.ui.settings.model = defaults.model;
                             state.ui.settings_message = match settings::load_api_key(
@@ -322,7 +322,7 @@ impl Plugin for AgentPlugin {
                                 }
                             };
                         }
-                        agent_ui::UiAction::SaveApiKey => {
+                        composer_ui::UiAction::SaveApiKey => {
                             let key_result = settings::save_api_key(
                                 state.ui.settings.kind,
                                 &state.ui.settings.base_url,
@@ -488,7 +488,7 @@ impl Plugin for AgentPlugin {
 
 /// Converts one [`scheduler::ScheduledEvent`] into the `NoteEvent`
 /// type `nih_plug` expects, and sends it to the host.
-fn emit_event(context: &mut impl ProcessContext<AgentPlugin>, event: scheduler::ScheduledEvent) {
+fn emit_event(context: &mut impl ProcessContext<ComposerPlugin>, event: scheduler::ScheduledEvent) {
     let note_event = match event.kind {
         scheduler::ScheduledEventKind::NoteOn { velocity } => NoteEvent::NoteOn {
             timing: event.timing,
@@ -516,7 +516,7 @@ fn emit_event(context: &mut impl ProcessContext<AgentPlugin>, event: scheduler::
 fn save_clip_to_file(clip: &MidiClip) -> Result<String, String> {
     let Some(path) = rfd::FileDialog::new()
         .add_filter("MIDI file", &["mid", "midi"])
-        .set_file_name("ai-midi-agent-demo.mid")
+        .set_file_name("ai-midi-composer-demo.mid")
         .save_file()
     else {
         return Ok(String::new());
@@ -587,8 +587,8 @@ fn load_clip_from_file() -> Result<Option<MidiClip>, String> {
     Ok(Some(clip))
 }
 
-impl ClapPlugin for AgentPlugin {
-    const CLAP_ID: &'static str = "com.example.ai-midi-agent";
+impl ClapPlugin for ComposerPlugin {
+    const CLAP_ID: &'static str = "com.example.ai-midi-composer";
     const CLAP_DESCRIPTION: Option<&'static str> =
         Some("Open source AI MIDI generator (development build)");
     const CLAP_MANUAL_URL: Option<&'static str> = None;
@@ -596,10 +596,10 @@ impl ClapPlugin for AgentPlugin {
     const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::Instrument, ClapFeature::Stereo];
 }
 
-impl Vst3Plugin for AgentPlugin {
-    const VST3_CLASS_ID: [u8; 16] = *b"AiMidiAgentDev00";
+impl Vst3Plugin for ComposerPlugin {
+    const VST3_CLASS_ID: [u8; 16] = *b"AiMidiComposerD0";
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Instrument];
 }
 
-nih_export_clap!(AgentPlugin);
-nih_export_vst3!(AgentPlugin);
+nih_export_clap!(ComposerPlugin);
+nih_export_vst3!(ComposerPlugin);

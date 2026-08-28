@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/agent-core",
-    "crates/agent-plugin",
-    "crates/agent-ui",
+    "crates/composer-core",
+    "crates/composer-plugin",
+    "crates/composer-ui",
     "xtask",
 ]
 
@@ -11,4 +11,4 @@ members = [
 version = "0.0.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/example/ai-midi-agent"
+repository = "https://github.com/example/ai-midi-composer"

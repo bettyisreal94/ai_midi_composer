@@ -3,18 +3,18 @@
 //! A review after Phase 3 (see `REVIEW.md`) found that this crate was
 //! an unused placeholder, even though `TODO.md` and `README.md`
 //! already described it as owning the plugin window. All of Phase 3's
-//! UI code lived in `agent-plugin` instead. This module fixes that.
+//! UI code lived in `composer-plugin` instead. This module fixes that.
 //!
 //! This crate does not talk to `nih_plug`, a host, the file system, or
 //! the OS keychain. It only draws widgets, and reports back which
-//! buttons the user pressed, as [`UiAction`] values. `agent-plugin` is
+//! buttons the user pressed, as [`UiAction`] values. `composer-plugin` is
 //! the one that creates the `nih_plug_egui` editor window, decides
 //! what an action means (running the stub generator, opening a save
 //! dialog, reading or writing the OS keychain), and owns any state a
 //! host integration needs, such as a pending background task's request
 //! ID.
 
-use agent_core::midi::MidiClip;
+use composer_core::midi::MidiClip;
 
 /// The state shown by the status label next to "Generate" and "Vary
 /// current clip". Also used for "Load .mid...", since loading a file
@@ -35,8 +35,8 @@ pub enum GenerationStatus {
 }
 
 /// Which AI provider shape the settings panel is configured for. Phase
-/// 4 only defines these two client shapes in `agent-core`; see
-/// `agent_core::provider`.
+/// 4 only defines these two client shapes in `composer-core`; see
+/// `composer_core::provider`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     /// OpenAI, DeepSeek, OpenRouter, Ollama, LM Studio, and any other
@@ -57,7 +57,7 @@ impl ProviderKind {
     }
 }
 
-/// The provider settings the user can edit. `agent-plugin` is
+/// The provider settings the user can edit. `composer-plugin` is
 /// responsible for actually building an `AiProvider` from these
 /// values, and for reading and writing `api_key` to the OS keychain;
 /// this crate only holds the text the user typed.
@@ -65,7 +65,7 @@ pub struct ProviderSettings {
     pub kind: ProviderKind,
     pub base_url: String,
     pub model: String,
-    /// Kept only in memory by this crate. Never logged. `agent-plugin`
+    /// Kept only in memory by this crate. Never logged. `composer-plugin`
     /// reads this to store it in the OS keychain, only when the user
     /// presses "Save API key", not on every keystroke.
     pub api_key: String,
@@ -85,7 +85,7 @@ impl ProviderSettings {
             },
             ProviderKind::Anthropic => Self {
                 kind,
-                base_url: agent_core::AnthropicProvider::DEFAULT_BASE_URL.to_string(),
+                base_url: composer_core::AnthropicProvider::DEFAULT_BASE_URL.to_string(),
                 model: "claude-3-5-haiku-20241022".to_string(),
                 api_key: String::new(),
             },
@@ -99,7 +99,7 @@ impl Default for ProviderSettings {
     }
 }
 
-/// An action the user asked for by pressing a button. `agent-plugin`
+/// An action the user asked for by pressing a button. `composer-plugin`
 /// decides what to actually do about it; this crate only reports that
 /// it happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +115,7 @@ pub enum UiAction {
     LoadMidFile,
     /// The user pressed "Save as .mid".
     Save,
-    /// The user picked a different provider kind. `agent-plugin` should
+    /// The user picked a different provider kind. `composer-plugin` should
     /// look up any API key already saved for the new kind, and fill
     /// `settings.api_key` with it (or clear it, if there is none).
     ProviderKindChanged,
@@ -170,7 +170,7 @@ pub fn draw(
     let mut actions = Vec::new();
 
     egui::CentralPanel::default().show(ctx, |ui| {
-        ui.heading("AI MIDI Agent (dev)");
+        ui.heading("AI MIDI Composer (dev)");
         ui.label(
             "\"Generate\" makes a new clip from the prompt below. \"Vary \
              current clip\" changes the loaded clip by the prompt's \

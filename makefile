@@ -14,7 +14,7 @@
 #
 # Run `make` with no target to run the default step, which is `build`.
 
-PLUGIN := agent-plugin
+PLUGIN := composer-plugin
 BUNDLE_DIR := target/bundled
 CLAP_BUNDLE := $(BUNDLE_DIR)/$(PLUGIN).clap
 VST3_BUNDLE := $(BUNDLE_DIR)/$(PLUGIN).vst3

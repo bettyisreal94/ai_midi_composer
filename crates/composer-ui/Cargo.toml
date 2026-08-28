@@ -1,10 +1,10 @@
 [package]
-name = "agent-ui"
+name = "composer-ui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agent-core = { path = "../agent-core" }
+composer-core = { path = "../composer-core" }
 egui = "0.31"

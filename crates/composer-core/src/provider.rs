@@ -6,7 +6,7 @@
 //! any prompt, not only a MIDI-generation one.
 //!
 //! Every provider here is a blocking (synchronous) HTTP call, not an
-//! `async` one. `agent-plugin` runs `AiProvider::complete()` inside a
+//! `async` one. `composer-plugin` runs `AiProvider::complete()` inside a
 //! `nih_plug` background task, on a thread `nih_plug` manages, so there
 //! is no need for a separate `async` runtime such as `tokio`. See
 //! `TODO.md`, section 5.
@@ -25,7 +25,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::json;
 
-/// A provider call gives up after this long. `agent-plugin` runs every
+/// A provider call gives up after this long. `composer-plugin` runs every
 /// call on `nih_plug`'s shared background worker, so a slow or hung
 /// call can hold that worker for up to this long; keep this well under
 /// a minute so a stuck request cannot make the plugin feel frozen for

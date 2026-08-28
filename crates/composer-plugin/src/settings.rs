@@ -3,22 +3,22 @@
 //! non-secret settings (provider kind, base URL, model) in a small JSON
 //! file in the OS's normal config directory.
 //!
-//! `agent-ui` never touches the keychain, the file system, or even
+//! `composer-ui` never touches the keychain, the file system, or even
 //! knows either one exists; see its module docs. This module is the
 //! only place in the project that calls into `keyring`, and the only
 //! place that reads or writes the settings file.
 
 use std::io::Read;
 
-use agent_ui::{ProviderKind, ProviderSettings};
+use composer_ui::{ProviderKind, ProviderSettings};
 use serde::{Deserialize, Serialize};
 
-const SERVICE_NAME: &str = "ai-midi-agent";
+const SERVICE_NAME: &str = "ai-midi-composer";
 
 /// A settings file larger than this is rejected outright, before it is
 /// even parsed as JSON. This file holds three short strings; this is
 /// generous headroom above that, not a realistic expectation. A limit
-/// here, the same way `agent-core::provider` bounds a provider
+/// here, the same way `composer-core::provider` bounds a provider
 /// response, stops a corrupted or hand-edited file from making this
 /// project read an unbounded amount of memory.
 const MAX_SETTINGS_FILE_BYTES: u64 = 100_000;
@@ -101,7 +101,7 @@ struct StoredSettings {
     model: String,
 }
 
-/// A serializable mirror of [`ProviderKind`]. `agent-ui` deliberately
+/// A serializable mirror of [`ProviderKind`]. `composer-ui` deliberately
 /// has no `serde` dependency (see its module docs), so this project's
 /// one JSON encoding of a provider kind lives here instead, next to the
 /// only code that reads or writes the settings file.
@@ -130,7 +130,7 @@ impl From<StoredProviderKind> for ProviderKind {
 }
 
 fn settings_file_path() -> Result<std::path::PathBuf, String> {
-    directories::ProjectDirs::from("", "", "ai-midi-agent")
+    directories::ProjectDirs::from("", "", "ai-midi-composer")
         .map(|dirs| dirs.config_dir().join("settings.json"))
         .ok_or_else(|| "could not find a config directory on this OS".to_string())
 }

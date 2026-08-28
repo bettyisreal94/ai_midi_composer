@@ -15,7 +15,7 @@ use crate::midi::{MidiClip, Note, TimeSignature, DEFAULT_TICKS_PER_QUARTER};
 use crate::provider::{AiProvider, ProviderError};
 
 /// The system instructions sent to the model, through the provider's
-/// own system-instruction field (see `agent_core::provider`'s module
+/// own system-instruction field (see `composer_core::provider`'s module
 /// docs), separately from the user's own prompt. Fixes the JSON reply
 /// shape the rest of this module expects.
 ///

@@ -1,4 +1,4 @@
-//! Core logic for the AI MIDI Agent plugin.
+//! Core logic for the AI MIDI Composer plugin.
 //!
 //! This crate has no plugin code. It has the MIDI data model, in
 //! [`midi`]; the AI provider clients, in [`provider`]; and the
@@ -13,7 +13,7 @@ pub use pipeline::{generate_clip, generate_variation, parse_clip_reply, Pipeline
 pub use provider::{AiProvider, AnthropicProvider, OpenAiCompatibleProvider, ProviderError};
 
 pub fn placeholder() -> &'static str {
-    "agent-core"
+    "composer-core"
 }
 
 #[cfg(test)]
@@ -22,6 +22,6 @@ mod tests {
 
     #[test]
     fn placeholder_returns_name() {
-        assert_eq!(placeholder(), "agent-core");
+        assert_eq!(placeholder(), "composer-core");
     }
 }

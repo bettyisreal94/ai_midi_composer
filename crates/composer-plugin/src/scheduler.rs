@@ -81,7 +81,7 @@
 //!    fixes this, and matches [`schedule_events`]'s own two window
 //!    tests exactly.
 
-use agent_core::midi::MidiClip;
+use composer_core::midi::MidiClip;
 
 /// Tracks how many note-on events this plugin has sent for each
 /// `(channel, pitch)` pair, with no matching note-off sent yet. Used
@@ -92,7 +92,7 @@ use agent_core::midi::MidiClip;
 /// never touches the allocator, so it is safe to hold on the audio
 /// thread. Counts, rather than one flag per key, because two
 /// overlapping notes at the same channel and pitch are possible (see
-/// `agent_core::midi`'s LIFO import policy), and both need their own
+/// `composer_core::midi`'s LIFO import policy), and both need their own
 /// note-off sent on cleanup.
 pub struct ActiveNotes {
     counts: [[u8; 128]; 16],
@@ -219,7 +219,7 @@ impl PlayableClip {
         // A note-off must sort before a note-on at the same tick,
         // regardless of the order the clip's notes happen to be
         // stored in. This matches the file writer's convention in
-        // `agent-core`.
+        // `composer-core`.
         events.sort_by_key(|event| {
             let priority = match event.kind {
                 ScheduledEventKind::NoteOff => 0,
@@ -395,7 +395,7 @@ pub fn schedule_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::midi::{Note, TimeSignature};
+    use composer_core::midi::{Note, TimeSignature};
 
     /// A one-octave, four note arpeggio, one beat apart, looping every
     /// 4 beats. The same shape as `demo_clip()` in `lib.rs`, kept as a

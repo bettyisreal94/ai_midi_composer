@@ -19,7 +19,7 @@
 //! `Drop`, ever happens on the audio thread.
 //!
 //! Each published clip carries a `generation` number, so
-//! `agent-plugin`'s `process()` can tell when the clip actually
+//! `composer-plugin`'s `process()` can tell when the clip actually
 //! changed (not just when the host's transport moved), and clean up
 //! and resynchronize accordingly.
 //!
@@ -33,7 +33,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agent_core::midi::MidiClip;
+use composer_core::midi::MidiClip;
 
 use crate::scheduler::PlayableClip;
 
@@ -47,7 +47,7 @@ pub struct PublishedClip {
     pub generation: u64,
 }
 
-/// The audio thread's side. Owned by `AgentPlugin`; never cloned or
+/// The audio thread's side. Owned by `ComposerPlugin`; never cloned or
 /// shared, since a triple buffer has exactly one reader.
 pub struct ClipReader {
     output: triple_buffer::Output<PublishedClip>,
@@ -111,7 +111,7 @@ impl ClipPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::midi::{Note, TimeSignature};
+    use composer_core::midi::{Note, TimeSignature};
 
     fn one_note_clip(pitch: u8) -> MidiClip {
         MidiClip {

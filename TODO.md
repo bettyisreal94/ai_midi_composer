@@ -89,13 +89,13 @@ These features come later, or may not come at all:
 
 The project has three layers:
 
-1. **Core library** (`agent-core`). This crate has no plugin code. It has
+1. **Core library** (`composer-core`). This crate has no plugin code. It has
    the MIDI data model, the AI provider clients, and the prompt templates.
    Other Rust programs can reuse this crate.
-2. **Plugin crate** (`agent-plugin`). This crate uses `agent-core`. It
+2. **Plugin crate** (`composer-plugin`). This crate uses `composer-core`. It
    builds the CLAP and VST3 plugin. It has the audio thread code and the
    plugin parameters.
-3. **UI crate** (`agent-ui`). This crate draws the plugin window. It sends
+3. **UI crate** (`composer-ui`). This crate draws the plugin window. It sends
    user actions to the plugin crate. It shows results from the plugin
    crate.
 
@@ -107,7 +107,7 @@ work: the "Generate" button called the stub generator inline, on the UI
 thread. Both are fixed now. This section describes what is actually
 built, not just a plan to check future code against.
 
-**Background work.** `agent-plugin` uses `nih_plug`'s own background
+**Background work.** `composer-plugin` uses `nih_plug`'s own background
 task mechanism: `Plugin::BackgroundTask`, `Plugin::task_executor()`, and
 `AsyncExecutor::execute_background()`. There is no separate `tokio`
 runtime, and Phase 4's real provider calls should use a blocking HTTP
@@ -126,11 +126,11 @@ phase that allows several requests at once (for example, a cancel
 button) will need to compare IDs when polling, to drop a response from
 a request a newer one already replaced.
 
-**The three crates.** `agent-ui` now holds the UI's own state
-(`agent_ui::EditorState`) and its rendering (`agent_ui::draw()`), and
+**The three crates.** `composer-ui` now holds the UI's own state
+(`composer_ui::EditorState`) and its rendering (`composer_ui::draw()`), and
 knows nothing about `nih_plug`, request IDs, or the file system. It
-returns which button the user pressed, as an `agent_ui::UiAction`
-value; `agent-plugin` decides what that action means. `agent-plugin`
+returns which button the user pressed, as an `composer_ui::UiAction`
+value; `composer-plugin` decides what that action means. `composer-plugin`
 creates the `nih_plug_egui` editor window, owns
 `background::GenerationStore`, and does the host-integration work a UI
 crate should not need to know about, such as opening a native save
@@ -138,7 +138,7 @@ dialog with `rfd`.
 
 **Live MIDI output is connected to "Generate", since Phase 5.** A
 freshly generated clip reaches the audio thread through a triple
-buffer (`crates/agent-plugin/src/clip_publisher.rs`), not a plain
+buffer (`crates/composer-plugin/src/clip_publisher.rs`), not a plain
 channel of owned `MidiClip` values: a review after Phase 3 found that
 replacing an owned value on the audio thread that way can still drop
 its old, heap-backed `Vec<Note>` there, even behind a bounded,
@@ -153,20 +153,20 @@ update, and clean up and resynchronize only when the clip itself
 changed. See Phase 5 for the full explanation.
 
 ```
-                +----------------+
-   Host DAW --> |  CLAP / VST3   |
-                |  plugin shell  |
-                |  (agent-plugin)|
-                +----+------+----+
-                     |      |
-             audio   |      |  UI events
-             thread  |      |
-                     v      v
-              +-------------------+        +----------------+
-              |   agent-core      | <----> |  AI provider   |
-              |  (MIDI + prompt   |  HTTP  |  (OpenAI,      |
-              |   + job queue)    |        |   Claude, ...) |
-              +-------------------+        +----------------+
+                +---------------------+
+   Host DAW --> |     CLAP / VST3     |
+                |     plugin shell    |
+                |  (composer-plugin)  |
+                +--------+---+--------+
+                         |   |
+                 audio   |   |  UI events
+                 thread  |   |
+                         v   v
+              +--------------------+        +----------------+
+              |    composer-core   | <----> |  AI provider   |
+              |  (MIDI + prompt    |  HTTP  |  (OpenAI,      |
+              |   + job queue)     |        |   Claude, ...) |
+              +--------------------+        +----------------+
 ```
 
 ## 6. Rust crates to use
@@ -176,7 +176,7 @@ changed. See Phase 5 for the full explanation.
   own task executor; see section 5. No separate async runtime is
   needed for this.
 - `nih_plug_egui` — draws the plugin window with `egui`.
-- `egui` — the widget toolkit `agent-ui` draws with. `agent-ui` depends
+- `egui` — the widget toolkit `composer-ui` draws with. `composer-ui` depends
   on this directly (not through `nih_plug_egui`), so it stays usable
   without pulling in `nih_plug`'s windowing backend.
 - `midly` — reads and writes standard MIDI files.
@@ -198,10 +198,11 @@ changed. See Phase 5 for the full explanation.
 vst/
   Cargo.toml               # workspace file
   crates/
-    agent-core/             # MIDI model; AI clients come in Phase 4
-    agent-plugin/           # CLAP/VST3 plugin: host integration, real-time
-                             # code, and background task execution
-    agent-ui/               # the plugin window's UI state and rendering
+    composer-core/    # MIDI model, AI provider clients, and the prompt
+                      # pipeline
+    composer-plugin/  # CLAP/VST3 plugin: host integration, real-time
+                      # code, and background task execution
+    composer-ui/      # the plugin window's UI state and rendering
   xtask/                    # build and bundle scripts
   TODO.md
   README.md
@@ -231,7 +232,7 @@ vst/
 ### Phase 1 — MIDI data model
 - [x] Define a `Note` struct: pitch, velocity, start time, duration,
       channel.
-  - See `crates/agent-core/src/midi.rs`.
+  - See `crates/composer-core/src/midi.rs`.
 - [x] Define a `MidiClip` struct: a list of notes plus tempo and time
       signature.
 - [x] Write functions to convert a `MidiClip` to a standard MIDI file, and
@@ -277,7 +278,7 @@ support.
   - Decision: `Vst3SubCategory::Instrument` for VST3, and
     `ClapFeature::Instrument` (plus `ClapFeature::Stereo`, for the
     dummy audio bus) for CLAP.
-  - See `crates/agent-plugin/src/lib.rs`.
+  - See `crates/composer-plugin/src/lib.rs`.
 - [x] Build a small, fixed `MidiClip` value inside the plugin, using the
       Phase 1 data model. This stands in for real AI generation, until
       Phase 5.
@@ -310,7 +311,7 @@ support.
     the host reports one.
   - A review after Phase 3 (see `REVIEW.md`) found three real bugs in
     the first version of this scheduler, all fixed, with unit tests, in
-    `crates/agent-plugin/src/scheduler.rs`:
+    `crates/composer-plugin/src/scheduler.rs`:
     - A note ending exactly on the loop boundary never got its
       note-off, and stayed stuck on forever. Fixed with an asymmetric
       half-open interval for note starts versus note ends.
@@ -341,7 +342,7 @@ support.
     made it walk a precomputed event list with a cursor, instead of
     scanning and sorting notes on every audio callback): starting the
     plugin could make its memory use grow past 50 GB. Two real bugs,
-    both in `crates/agent-plugin/src/scheduler.rs`, caused this,
+    both in `crates/composer-plugin/src/scheduler.rs`, caused this,
     fixed now, with a regression test:
     - `schedule_events` wrapped its event cursor back to 0 whenever it
       reached the end of the event list, with no limit on how many
@@ -359,7 +360,7 @@ support.
       silently scheduled nothing at all, forever, until the next
       discontinuity. Fixed by skipping a same-tick note-off, while
       still landing on a same-tick note-on.
-    - See `crates/agent-plugin/src/scheduler.rs`'s module docs for the
+    - See `crates/composer-plugin/src/scheduler.rs`'s module docs for the
       full explanation. Running this module's own unit tests, which
       hung instead of finishing, is what confirmed the first bug.
 - [x] Confirm this works on macOS.
@@ -379,7 +380,7 @@ support.
   - Disabled while a request is pending, so the user cannot start a
     second one (see the Phase 3.5 note below).
 - [x] Add a status label for "working", "done", and "error" states.
-  - See `agent_ui::GenerationStatus`.
+  - See `composer_ui::GenerationStatus`.
   - Unlike the first version of this phase, "working" is now real and
     reachable: pressing "Generate" submits a background task (Phase
     3.5 below), and the label shows "working…" until it finishes.
@@ -395,7 +396,7 @@ support.
     editor itself, not only in the log (a review after this phase
     flagged the log-only version as a real gap).
   - Note: the editor's clip (what "Generate" and "Save as .mid" use)
-    and `AgentPlugin::clip` (what the audio thread plays back live,
+    and `ComposerPlugin::clip` (what the audio thread plays back live,
     from Phase 2) are still two separate values. Phase 5 connects
     them; see section 5 for why that handoff needs more thought than a
     plain channel.
@@ -408,18 +409,18 @@ support.
 A review after Phase 3 (see `REVIEW.md`) found two structural problems,
 fixed here, ahead of Phase 4, since Phase 4 builds directly on both:
 
-- [x] Move the UI's reusable state and rendering into `agent-ui`, which
+- [x] Move the UI's reusable state and rendering into `composer-ui`, which
       was an unused placeholder until now, even though `TODO.md` and
       `README.md` already described it as owning the plugin window.
-  - `agent-ui` now has no dependency on `nih_plug`: it exposes
+  - `composer-ui` now has no dependency on `nih_plug`: it exposes
     `EditorState`, `GenerationStatus`, `UiAction`, and a `draw()`
     function that returns which action the user asked for.
-  - `agent-plugin` still creates the actual `nih_plug_egui` editor,
+  - `composer-plugin` still creates the actual `nih_plug_egui` editor,
     decides what an action means, and does host-integration work such
     as opening the save dialog.
 - [x] Give the editor a real seam for background work, instead of
       calling the stub inline on the UI thread.
-  - See `crates/agent-plugin/src/background.rs`: `GenerateTask`
+  - See `crates/composer-plugin/src/background.rs`: `GenerateTask`
     carries a request ID, not the prompt text; `GenerationStore` holds
     the actual prompts and results, behind a `Mutex`, shared between
     the editor and `Plugin::task_executor()`; and the editor polls for
@@ -429,7 +430,7 @@ fixed here, ahead of Phase 4, since Phase 4 builds directly on both:
     real provider call; the rest should not need to change.
 - [x] A generated clip's note list no longer grows the window without
       bound.
-  - `agent_ui::draw()` puts it in a scrolling area with a fixed
+  - `composer_ui::draw()` puts it in a scrolling area with a fixed
     maximum height.
 
 ### Phase 4 — AI provider clients
@@ -442,7 +443,7 @@ prompt template and a JSON reply format, which do not exist yet.
 
 - [x] Define an `AiProvider` trait with one method: send a prompt,
       return text.
-  - See `crates/agent-core/src/provider.rs`.
+  - See `crates/composer-core/src/provider.rs`.
   - Every provider call is blocking (synchronous), not `async`, so it
     can run inside a `nih_plug` background task with no separate async
     runtime; see section 5.
@@ -458,14 +459,14 @@ prompt template and a JSON reply format, which do not exist yet.
   - Tested the same way as the OpenAI-compatible client.
 - [x] Add a settings panel in the UI for provider choice, API key, and
       base URL.
-  - See `agent_ui::ProviderSettings`, and the "Provider settings"
-    section `agent_ui::draw()` adds.
+  - See `composer_ui::ProviderSettings`, and the "Provider settings"
+    section `composer_ui::draw()` adds.
   - Picking a different provider kind loads whatever key is already
     saved for it, instead of leaving the previous provider's key
     visible under the wrong one.
 - [x] Store the API key with the `keyring` crate.
-  - See `crates/agent-plugin/src/settings.rs`, the only place in the
-    project that calls into `keyring`; `agent-ui` does not know the
+  - See `crates/composer-plugin/src/settings.rs`, the only place in the
+    project that calls into `keyring`; `composer-ui` does not know the
     keychain exists.
   - Saving happens only when the user presses "Save API key", not on
     every keystroke.
@@ -499,7 +500,7 @@ prompt template and a JSON reply format, which do not exist yet.
 ### Phase 5 — Prompt-to-MIDI pipeline
 - [x] Write a system prompt that asks the model for MIDI notes in a fixed
       JSON format.
-  - See `SYSTEM_PROMPT` in `crates/agent-core/src/pipeline.rs`.
+  - See `SYSTEM_PROMPT` in `crates/composer-core/src/pipeline.rs`.
   - The JSON format uses beats (quarter notes), not ticks, for note
     timing: a model reasons about music in beats far more reliably
     than in an arbitrary tick resolution. `parse_clip_reply` converts
@@ -523,13 +524,13 @@ prompt template and a JSON reply format, which do not exist yet.
     fail the same way again immediately. See `generate_clip()`'s docs
     for the reasoning.
   - The error message shown to the user, and fed back to the model on
-    retry, is decided by `agent_ui::draw()` and `agent-plugin`'s
+    retry, is decided by `composer_ui::draw()` and `composer-plugin`'s
     editor code, the same as every other status message in the
     editor.
 - [x] Design a real-time-safe way to send a freshly generated `MidiClip`
       to the audio thread, for live playback.
   - Used a triple buffer (the `triple_buffer` crate), through a new
-    `crates/agent-plugin/src/clip_publisher.rs` module, exactly as
+    `crates/composer-plugin/src/clip_publisher.rs` module, exactly as
     this file recommended. Writing a new clip (on the editor's or the
     background executor's thread) drops the old one there; reading
     the latest clip (on the audio thread, every `process()` call)
@@ -553,8 +554,8 @@ prompt template and a JSON reply format, which do not exist yet.
       playback.
   - Automated tests cover every step of this path except the real
     network call itself, which already has its own tests in Phase 4
-    (`agent-core`'s provider tests) against a local mock server: the
-    system prompt and JSON parsing (`agent-core::pipeline`, 8
+    (`composer-core`'s provider tests) against a local mock server: the
+    system prompt and JSON parsing (`composer-core::pipeline`, 8
     tests), the retry behavior (mocked `AiProvider`, no real network
     call), the clip publisher's generation tracking
     (`clip_publisher`, 4 tests), and the background request-ID
@@ -586,14 +587,14 @@ prompt template and a JSON reply format, which do not exist yet.
     satisfies this item, since the plan said "a file picker **or**
     drag-and-drop target".
 - [x] Read the file into a `MidiClip` with the Phase 1 code.
-  - See `load_clip_from_file()` in `crates/agent-plugin/src/lib.rs`.
+  - See `load_clip_from_file()` in `crates/composer-plugin/src/lib.rs`.
     It reads the chosen path's bytes, then calls
     `MidiClip::from_smf_bytes()`.
   - A review found this read the whole chosen file with no size limit
     at all, on the UI thread, so an accidental or hostile
     multi-gigabyte file could stall the editor and exhaust memory. It
     now checks the file's size first, and also bounds the read itself
-    (the same defense-in-depth shape `agent_core::provider` already
+    (the same defense-in-depth shape `composer_core::provider` already
     uses for a provider response body), and rejects anything over 5 MB
     before `MidiClip::from_smf_bytes()` ever sees it. Moving the read
     itself onto a background thread, so a large-but-allowed file
@@ -606,7 +607,7 @@ prompt template and a JSON reply format, which do not exist yet.
   - Added a second button, "Vary current clip", next to "Generate".
     It sends the loaded clip's notes, as the same beats-based JSON
     `parse_clip_reply` reads, plus the prompt box's text as the
-    instruction. See `agent_core::generate_variation()`.
+    instruction. See `composer_core::generate_variation()`.
   - It reuses `generate_clip()`'s retry behavior directly, by building
     a single, richer prompt string that embeds both the existing clip
     and the instruction: the retry logic does not need to know the
@@ -631,7 +632,7 @@ prompt template and a JSON reply format, which do not exist yet.
       correct bundle format for CLAP and VST3.
   - Done ahead of schedule, during Phase 0: the `xtask` crate does
     this with the `nih_plug` bundler, run through
-    `cargo xtask bundle agent-plugin --release`, or `make pack`.
+    `cargo xtask bundle composer-plugin --release`, or `make pack`.
 - [x] Write install steps for Linux: copy files to `~/.clap` and
       `~/.vst3`.
   - Done ahead of schedule: see `make install` and `README.md`.
@@ -668,7 +669,7 @@ prompt template and a JSON reply format, which do not exist yet.
 
 ## 9. Testing plan
 
-- [x] Add unit tests for the MIDI conversion code in `agent-core`.
+- [x] Add unit tests for the MIDI conversion code in `composer-core`.
   - Done in Phase 1, and expanded after a Phase 3 review found real
     gaps in the import side.
   - The tests now cover normal round trips, and failure modes:
@@ -680,10 +681,10 @@ prompt template and a JSON reply format, which do not exist yet.
     ticks-per-quarter-note value, a malformed time signature
     denominator, format 2 (sequential) files, and a per-track tick
     overflow.
-- [x] Add unit tests for the live MIDI scheduler in `agent-plugin`.
+- [x] Add unit tests for the live MIDI scheduler in `composer-plugin`.
   - Not in the original plan; added after a Phase 3 review found real
     scheduler bugs (see Phase 2).
-  - The scheduling math lives in `crates/agent-plugin/src/scheduler.rs`,
+  - The scheduling math lives in `crates/composer-plugin/src/scheduler.rs`,
     with no `nih_plug` types in it, specifically so it can have plain
     unit tests with no host needed.
   - Tests cover: a single note's on and off, a note left open across
@@ -697,14 +698,14 @@ prompt template and a JSON reply format, which do not exist yet.
     since that needs a real or mocked `nih_plug` `Transport`; it is
     only exercised indirectly, by `clap-validator`'s `transport-fuzz`
     tests.
-- [x] Add unit tests for the AI provider clients in `agent-core`.
+- [x] Add unit tests for the AI provider clients in `composer-core`.
   - Not in the original plan for this section; added in Phase 4.
   - Both clients are tested against a small local HTTP server,
     covering a successful reply, a non-success status code, and a
     malformed response body, with no real network call and no real
     API key needed.
 - [x] Add unit tests for the JSON parsing code in the prompt pipeline.
-  - Added in Phase 5. See `crates/agent-core/src/pipeline.rs`.
+  - Added in Phase 5. See `crates/composer-core/src/pipeline.rs`.
   - Tests cover: a well-formed reply, a reply wrapped in a Markdown
     code fence and surrounding text, a reply with no JSON object, a
     reply with no notes, and a reply whose notes fail
@@ -730,19 +731,19 @@ prompt template and a JSON reply format, which do not exist yet.
 - [x] Add unit tests for the real-time-safe clip handoff to the audio
       thread.
   - Not in the original plan; added in Phase 5, alongside the handoff
-    itself. See `crates/agent-plugin/src/clip_publisher.rs`.
+    itself. See `crates/composer-plugin/src/clip_publisher.rs`.
   - Tests cover: the initial clip is readable at generation 0, a
     published update is readable with a new generation, generation
     numbers keep increasing across several publishes, and a cloned
     publisher handle shares the same buffer as the original.
 - [x] Add unit tests for the background request-ID bookkeeping.
   - Not in the original plan; added in Phase 3.5, expanded in Phase 5
-    and Phase 6. See `crates/agent-plugin/src/background.rs`.
+    and Phase 6. See `crates/composer-plugin/src/background.rs`.
   - Tests cover only the bookkeeping (assigning IDs, a result being
     delivered by `poll()` exactly once, and a request correctly
     recording an existing clip for a "vary current clip" request),
     not a real network call: `run()`'s own behavior is already
-    covered by `agent_core::pipeline`'s and `agent_core::provider`'s
+    covered by `composer_core::pipeline`'s and `composer_core::provider`'s
     tests.
 - [ ] Add a manual test checklist. Run it before each release:
   - [ ] Plugin loads in a Linux host.

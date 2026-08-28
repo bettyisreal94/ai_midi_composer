@@ -6,10 +6,10 @@
 //! network call without blocking the UI. This module gives them a
 //! ready seam: submit a prompt and the provider settings to use, get a
 //! request ID back, and poll for a result under that ID later. Phase 5
-//! plugged a real call to `agent_core::generate_clip` in here, in
+//! plugged a real call to `composer_core::generate_clip` in here, in
 //! place of the Phase 3 stub. Phase 6 added an optional existing clip
 //! to a request: when present, `run()` calls
-//! `agent_core::generate_variation` instead, to vary that clip by the
+//! `composer_core::generate_variation` instead, to vary that clip by the
 //! prompt's instruction, rather than generating a new one from
 //! scratch.
 //!
@@ -21,8 +21,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use agent_core::midi::MidiClip;
-use agent_core::{AiProvider, AnthropicProvider, OpenAiCompatibleProvider};
+use composer_core::midi::MidiClip;
+use composer_core::{AiProvider, AnthropicProvider, OpenAiCompatibleProvider};
 
 pub type RequestId = u64;
 
@@ -36,14 +36,14 @@ pub struct GenerateTask(pub RequestId);
 /// afterward, while the request is still running, do not affect it.
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
-    pub kind: agent_ui::ProviderKind,
+    pub kind: composer_ui::ProviderKind,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
 }
 
-impl From<&agent_ui::ProviderSettings> for ProviderConfig {
-    fn from(settings: &agent_ui::ProviderSettings) -> Self {
+impl From<&composer_ui::ProviderSettings> for ProviderConfig {
+    fn from(settings: &composer_ui::ProviderSettings) -> Self {
         Self {
             kind: settings.kind,
             base_url: settings.base_url.clone(),
@@ -55,12 +55,12 @@ impl From<&agent_ui::ProviderSettings> for ProviderConfig {
 
 fn build_provider(config: &ProviderConfig) -> Box<dyn AiProvider> {
     match config.kind {
-        agent_ui::ProviderKind::OpenAiCompatible => Box::new(OpenAiCompatibleProvider::new(
+        composer_ui::ProviderKind::OpenAiCompatible => Box::new(OpenAiCompatibleProvider::new(
             config.base_url.clone(),
             config.api_key.clone(),
             config.model.clone(),
         )),
-        agent_ui::ProviderKind::Anthropic => Box::new(AnthropicProvider::with_base_url(
+        composer_ui::ProviderKind::Anthropic => Box::new(AnthropicProvider::with_base_url(
             config.base_url.clone(),
             config.api_key.clone(),
             config.model.clone(),
@@ -91,7 +91,7 @@ struct Requests {
 ///
 /// Only one request needs to be tracked at a time in this phase,
 /// because the editor disables "Generate" while a request is pending
-/// (see `agent_ui::draw`'s `generation_pending` parameter). That also
+/// (see `composer_ui::draw`'s `generation_pending` parameter). That also
 /// means a "stale response from an old request" can never happen here:
 /// there is never more than one outstanding request to begin with. A
 /// future phase that allows several requests at once (for example, a
@@ -142,9 +142,9 @@ impl GenerationStore {
         let provider = build_provider(&request.config);
         let result = match &request.existing_clip {
             Some(existing_clip) => {
-                agent_core::generate_variation(provider.as_ref(), existing_clip, &request.prompt)
+                composer_core::generate_variation(provider.as_ref(), existing_clip, &request.prompt)
             }
-            None => agent_core::generate_clip(provider.as_ref(), &request.prompt),
+            None => composer_core::generate_clip(provider.as_ref(), &request.prompt),
         }
         .map_err(|err| err.to_string());
 
@@ -165,7 +165,7 @@ mod tests {
 
     fn config() -> ProviderConfig {
         ProviderConfig {
-            kind: agent_ui::ProviderKind::OpenAiCompatible,
+            kind: composer_ui::ProviderKind::OpenAiCompatible,
             base_url: "http://localhost".to_string(),
             api_key: String::new(),
             model: "test-model".to_string(),
@@ -191,7 +191,7 @@ mod tests {
     fn poll_delivers_a_result_exactly_once() {
         // Inserts a result directly, bypassing `run()`, so this test
         // does not need a real network call: `run()`'s own behavior is
-        // covered by `agent_core::pipeline`'s tests instead.
+        // covered by `composer_core::pipeline`'s tests instead.
         let store = GenerationStore::default();
         let id = store.submit("a".to_string(), config(), None);
         store
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn submit_records_an_existing_clip_for_a_variation_request() {
-        use agent_core::midi::{MidiClip, Note, TimeSignature};
+        use composer_core::midi::{MidiClip, Note, TimeSignature};
 
         let store = GenerationStore::default();
         let clip = MidiClip {

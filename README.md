@@ -1,4 +1,4 @@
-# AI MIDI Agent
+# AI MIDI Composer
 
 > Status: work in progress. The plugin generates, imports, and varies
 > MIDI clips, using a real AI provider. It has not run in a real DAW
@@ -28,11 +28,11 @@ The plugin builds as a CLAP plugin and as a VST3 plugin. AU and AAX are not part
 vst/
   Cargo.toml          # workspace file
   crates/
-    agent-core/        # MIDI data model, AI provider clients, and the
-                        # prompt-to-MIDI pipeline
-    agent-plugin/       # the CLAP/VST3 plugin: host integration, real-time
-                         # code, and background task execution, using nih_plug
-    agent-ui/           # the plugin window's UI state and rendering, using egui
+    composer-core/    # MIDI data model, AI provider clients, and the
+                      # prompt-to-MIDI pipeline
+    composer-plugin/  # the CLAP/VST3 plugin: host integration, real-time
+                      # code, and background task execution, using nih_plug
+    composer-ui/      # the plugin window's UI state and rendering, using egui
   xtask/                # build script that creates the plugin bundles
   TODO.md               # the project plan
 ```
@@ -98,14 +98,14 @@ The plugin does not build as a normal Rust binary. It builds as a `cdylib`, and 
 Run this command to build both bundles:
 
 ```sh
-cargo xtask bundle agent-plugin --release
+cargo xtask bundle composer-plugin --release
 ```
 
 The bundles appear here:
 
 ```
-target/bundled/agent-plugin.clap
-target/bundled/agent-plugin.vst3
+target/bundled/composer-plugin.clap
+target/bundled/composer-plugin.vst3
 ```
 
 ## Install the plugin bundles for local testing
@@ -118,19 +118,19 @@ On Linux:
 
 ```sh
 mkdir -p ~/.clap ~/.vst3
-cp -r target/bundled/agent-plugin.clap ~/.clap/
-cp -r target/bundled/agent-plugin.vst3 ~/.vst3/
+cp -r target/bundled/composer-plugin.clap ~/.clap/
+cp -r target/bundled/composer-plugin.vst3 ~/.vst3/
 ```
 
 On macOS:
 
 ```sh
 mkdir -p ~/Library/Audio/Plug-Ins/CLAP ~/Library/Audio/Plug-Ins/VST3
-cp -r target/bundled/agent-plugin.clap ~/Library/Audio/Plug-Ins/CLAP/
-cp -r target/bundled/agent-plugin.vst3 ~/Library/Audio/Plug-Ins/VST3/
+cp -r target/bundled/composer-plugin.clap ~/Library/Audio/Plug-Ins/CLAP/
+cp -r target/bundled/composer-plugin.vst3 ~/Library/Audio/Plug-Ins/VST3/
 ```
 
-Then open your DAW and rescan its plugin list. The plugin shows up as "AI MIDI Agent (dev)".
+Then open your DAW and rescan its plugin list. The plugin shows up as "AI MIDI Composer (dev)".
 
 ## Test the plugin without a DAW
 
@@ -142,14 +142,14 @@ You can check the plugin bundles with two free command-line tools. This is usefu
   bundle:
 
   ```sh
-  pluginval --strictness-level 5 --validate target/bundled/agent-plugin.vst3
+  pluginval --strictness-level 5 --validate target/bundled/composer-plugin.vst3
   ```
 
 - [`clap-validator`](https://github.com/free-audio/clap-validator) checks
   the CLAP bundle:
 
   ```sh
-  clap-validator validate target/bundled/agent-plugin.clap
+  clap-validator validate target/bundled/composer-plugin.clap
   ```
 
 Known result at the current stage: `clap-validator` reports 2 failed tests out of 32. Both are explained in `TODO.md`, section 11. Neither one blocks development.
