@@ -10,18 +10,45 @@
 //! `nih_plug` background task, on a thread `nih_plug` manages, so there
 //! is no need for a separate `async` runtime such as `tokio`. See
 //! `TODO.md`, section 5.
+//!
+//! `system_prompt` and `user_prompt` are sent through each API's own
+//! system-instruction field (OpenAI-compatible: a `system` role
+//! message; Anthropic: the top-level `system` field), not concatenated
+//! into one user message. Providers can weigh a system instruction
+//! differently from a user one, so keeping them separate matches how
+//! these APIs are meant to be used.
 
 use std::fmt;
+use std::io::Read;
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::json;
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// A provider call gives up after this long. `agent-plugin` runs every
+/// call on `nih_plug`'s shared background worker, so a slow or hung
+/// call can hold that worker for up to this long; keep this well under
+/// a minute so a stuck request cannot make the plugin feel frozen for
+/// too long. Whether plugin unload itself waits for an in-flight call
+/// to finish, or time out, is host and `nih_plug` behavior this
+/// project has not tested against a real host; see `TODO.md`.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Something that can turn a text prompt into a text reply.
+/// A provider reply larger than this is rejected outright, before it
+/// is even parsed as JSON. A JSON object describing a few dozen MIDI
+/// notes is a few kilobytes at most; this is generous headroom above
+/// that, not a realistic expectation.
+const MAX_RESPONSE_BYTES: usize = 1_000_000;
+
+/// How long an error message shown to the user, or embedded in a retry
+/// prompt, may quote from a raw, unparsed response body. Longer than
+/// this is truncated, so a provider that returns a large or malformed
+/// body cannot flood the editor or a retry prompt with it.
+const MAX_QUOTED_BODY_CHARS: usize = 300;
+
+/// Something that can turn a prompt into a text reply.
 pub trait AiProvider {
-    fn complete(&self, prompt: &str) -> Result<String, ProviderError>;
+    fn complete(&self, system_prompt: &str, user_prompt: &str) -> Result<String, ProviderError>;
 }
 
 /// An error from an [`AiProvider`].
@@ -53,6 +80,18 @@ impl fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
+/// Shortens `text` to at most [`MAX_QUOTED_BODY_CHARS`] characters, so
+/// a raw response body embedded in an error message, or a retry
+/// prompt, cannot grow without bound.
+fn truncate_for_display(text: &str) -> String {
+    if text.chars().count() <= MAX_QUOTED_BODY_CHARS {
+        text.to_string()
+    } else {
+        let head: String = text.chars().take(MAX_QUOTED_BODY_CHARS).collect();
+        format!("{head}… (truncated)")
+    }
+}
+
 /// Tries to pull a human-readable message out of an error response
 /// body. Both the OpenAI and the Anthropic APIs shape their error
 /// bodies as `{"error": {"message": "...", ...}}`, so one function
@@ -68,7 +107,7 @@ fn error_message_from_body(body: &str) -> Option<String> {
     }
     serde_json::from_str::<ErrorBody>(body)
         .ok()
-        .map(|body| body.error.message)
+        .map(|body| truncate_for_display(&body.error.message))
 }
 
 fn build_client() -> reqwest::blocking::Client {
@@ -76,6 +115,37 @@ fn build_client() -> reqwest::blocking::Client {
         .timeout(REQUEST_TIMEOUT)
         .build()
         .expect("building an HTTP client with the default TLS setup should not fail")
+}
+
+/// Joins `base` and `path` with exactly one slash between them,
+/// regardless of whether `base` already ends with one. Without this, a
+/// base URL with a trailing slash (a very easy mistake to paste in)
+/// silently produces a double slash in the request path.
+fn join_url(base: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+/// Reads `response`'s body, rejecting it outright if it is larger than
+/// [`MAX_RESPONSE_BYTES`], instead of buffering an unbounded amount of
+/// memory for a misbehaving or hostile server.
+fn read_body_bounded(response: reqwest::blocking::Response) -> Result<String, ProviderError> {
+    let mut buf = Vec::new();
+    response
+        .take(MAX_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|err| ProviderError::Request(err.to_string()))?;
+    if buf.len() > MAX_RESPONSE_BYTES {
+        return Err(ProviderError::UnexpectedResponse(format!(
+            "the response was larger than the {MAX_RESPONSE_BYTES}-byte limit"
+        )));
+    }
+    String::from_utf8(buf).map_err(|err| {
+        ProviderError::UnexpectedResponse(format!("the response was not valid UTF-8: {err}"))
+    })
 }
 
 /// A client for OpenAI-compatible chat APIs. This one client shape
@@ -90,9 +160,11 @@ pub struct OpenAiCompatibleProvider {
 }
 
 impl OpenAiCompatibleProvider {
-    /// `base_url` must not have a trailing slash, for example
-    /// `https://api.openai.com/v1`, or `http://localhost:11434/v1` for
-    /// a local Ollama server.
+    const MAX_TOKENS: u32 = 4096;
+
+    /// For example `https://api.openai.com/v1`, or
+    /// `http://localhost:11434/v1` for a local Ollama server. A
+    /// trailing slash is fine; it is removed before use.
     pub fn new(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
@@ -108,7 +180,7 @@ impl OpenAiCompatibleProvider {
 }
 
 impl AiProvider for OpenAiCompatibleProvider {
-    fn complete(&self, prompt: &str) -> Result<String, ProviderError> {
+    fn complete(&self, system_prompt: &str, user_prompt: &str) -> Result<String, ProviderError> {
         #[derive(Deserialize)]
         struct ChatResponse {
             choices: Vec<Choice>,
@@ -119,43 +191,55 @@ impl AiProvider for OpenAiCompatibleProvider {
         }
         #[derive(Deserialize)]
         struct ChatMessage {
-            content: String,
+            /// `None` for a reply this project cannot use as text: a
+            /// tool call, a refusal, or another non-text response
+            /// shape some OpenAI-compatible servers can return here.
+            content: Option<String>,
         }
 
-        let url = format!("{}/chat/completions", self.base_url);
+        let url = join_url(&self.base_url, "chat/completions");
         let response = self
             .client
             .post(&url)
             .bearer_auth(&self.api_key)
             .json(&json!({
                 "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": Self::MAX_TOKENS,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
             }))
             .send()
             .map_err(|err| ProviderError::Request(err.to_string()))?;
 
         let status = response.status();
-        let body = response
-            .text()
-            .map_err(|err| ProviderError::Request(err.to_string()))?;
+        let body = read_body_bounded(response)?;
 
         if !status.is_success() {
-            let message = error_message_from_body(&body).unwrap_or_else(|| body.clone());
+            let message =
+                error_message_from_body(&body).unwrap_or_else(|| truncate_for_display(&body));
             return Err(ProviderError::Api {
                 status: status.as_u16(),
                 message,
             });
         }
 
-        let parsed: ChatResponse = serde_json::from_str(&body)
-            .map_err(|err| ProviderError::UnexpectedResponse(format!("{err}: {body}")))?;
+        let parsed: ChatResponse = serde_json::from_str(&body).map_err(|err| {
+            ProviderError::UnexpectedResponse(format!("{err}: {}", truncate_for_display(&body)))
+        })?;
 
-        parsed
-            .choices
-            .into_iter()
-            .next()
-            .map(|choice| choice.message.content)
-            .ok_or_else(|| ProviderError::UnexpectedResponse("no choices in response".to_string()))
+        let choice = parsed.choices.into_iter().next().ok_or_else(|| {
+            ProviderError::UnexpectedResponse("no choices in response".to_string())
+        })?;
+
+        choice.message.content.ok_or_else(|| {
+            ProviderError::UnexpectedResponse(
+                "the model's reply had no text content (it may have been a tool call, a \
+                 refusal, or another non-text response)"
+                    .to_string(),
+            )
+        })
     }
 }
 
@@ -179,6 +263,8 @@ impl AnthropicProvider {
         Self::with_base_url(Self::DEFAULT_BASE_URL, api_key, model)
     }
 
+    /// A trailing slash on `base_url` is fine; it is removed before
+    /// use.
     pub fn with_base_url(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
@@ -194,7 +280,7 @@ impl AnthropicProvider {
 }
 
 impl AiProvider for AnthropicProvider {
-    fn complete(&self, prompt: &str) -> Result<String, ProviderError> {
+    fn complete(&self, system_prompt: &str, user_prompt: &str) -> Result<String, ProviderError> {
         #[derive(Deserialize)]
         struct MessagesResponse {
             content: Vec<ContentBlock>,
@@ -206,7 +292,7 @@ impl AiProvider for AnthropicProvider {
             text: Option<String>,
         }
 
-        let url = format!("{}/v1/messages", self.base_url);
+        let url = join_url(&self.base_url, "v1/messages");
         let response = self
             .client
             .post(&url)
@@ -215,42 +301,51 @@ impl AiProvider for AnthropicProvider {
             .json(&json!({
                 "model": self.model,
                 "max_tokens": Self::MAX_TOKENS,
-                "messages": [{"role": "user", "content": prompt}],
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_prompt}],
             }))
             .send()
             .map_err(|err| ProviderError::Request(err.to_string()))?;
 
         let status = response.status();
-        let body = response
-            .text()
-            .map_err(|err| ProviderError::Request(err.to_string()))?;
+        let body = read_body_bounded(response)?;
 
         if !status.is_success() {
-            let message = error_message_from_body(&body).unwrap_or_else(|| body.clone());
+            let message =
+                error_message_from_body(&body).unwrap_or_else(|| truncate_for_display(&body));
             return Err(ProviderError::Api {
                 status: status.as_u16(),
                 message,
             });
         }
 
-        let parsed: MessagesResponse = serde_json::from_str(&body)
-            .map_err(|err| ProviderError::UnexpectedResponse(format!("{err}: {body}")))?;
+        let parsed: MessagesResponse = serde_json::from_str(&body).map_err(|err| {
+            ProviderError::UnexpectedResponse(format!("{err}: {}", truncate_for_display(&body)))
+        })?;
 
-        parsed
+        // A reply can have more than one text block. Earlier versions
+        // of this client only returned the first one, silently
+        // dropping the rest.
+        let text_blocks: Vec<String> = parsed
             .content
             .into_iter()
-            .find(|block| block.kind == "text")
-            .and_then(|block| block.text)
-            .ok_or_else(|| {
-                ProviderError::UnexpectedResponse("no text content in response".to_string())
-            })
+            .filter(|block| block.kind == "text")
+            .filter_map(|block| block.text)
+            .collect();
+
+        if text_blocks.is_empty() {
+            return Err(ProviderError::UnexpectedResponse(
+                "no text content in response".to_string(),
+            ));
+        }
+        Ok(text_blocks.join("\n"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::TcpListener;
     use std::thread;
 
@@ -288,7 +383,24 @@ mod tests {
         );
         let provider = OpenAiCompatibleProvider::new(base_url, "test-key", "test-model");
 
-        let reply = provider.complete("say hello").expect("should succeed");
+        let reply = provider
+            .complete("you are a helpful assistant", "say hello")
+            .expect("should succeed");
+        assert_eq!(reply, "hello there");
+    }
+
+    #[test]
+    fn openai_compatible_accepts_a_trailing_slash_on_the_base_url() {
+        let base_url = mock_server_once(
+            "HTTP/1.1 200 OK",
+            r#"{"choices":[{"message":{"role":"assistant","content":"hello there"}}]}"#.to_string(),
+        );
+        let provider =
+            OpenAiCompatibleProvider::new(format!("{base_url}/"), "test-key", "test-model");
+
+        let reply = provider
+            .complete("system", "say hello")
+            .expect("should succeed");
         assert_eq!(reply, "hello there");
     }
 
@@ -300,7 +412,9 @@ mod tests {
         );
         let provider = OpenAiCompatibleProvider::new(base_url, "bad-key", "test-model");
 
-        let err = provider.complete("say hello").expect_err("should fail");
+        let err = provider
+            .complete("system", "say hello")
+            .expect_err("should fail");
         match err {
             ProviderError::Api { status, message } => {
                 assert_eq!(status, 401);
@@ -315,7 +429,37 @@ mod tests {
         let base_url = mock_server_once("HTTP/1.1 200 OK", r#"{"unexpected":true}"#.to_string());
         let provider = OpenAiCompatibleProvider::new(base_url, "test-key", "test-model");
 
-        let err = provider.complete("say hello").expect_err("should fail");
+        let err = provider
+            .complete("system", "say hello")
+            .expect_err("should fail");
+        assert!(matches!(err, ProviderError::UnexpectedResponse(_)));
+    }
+
+    #[test]
+    fn openai_compatible_reports_a_null_content_reply_clearly() {
+        // A tool-call or refusal reply from a real OpenAI-compatible
+        // server can have `"content": null`.
+        let base_url = mock_server_once(
+            "HTTP/1.1 200 OK",
+            r#"{"choices":[{"message":{"role":"assistant","content":null}}]}"#.to_string(),
+        );
+        let provider = OpenAiCompatibleProvider::new(base_url, "test-key", "test-model");
+
+        let err = provider
+            .complete("system", "say hello")
+            .expect_err("null content should be reported, not panic");
+        assert!(matches!(err, ProviderError::UnexpectedResponse(_)));
+    }
+
+    #[test]
+    fn oversized_response_is_rejected() {
+        let huge_body = "x".repeat(MAX_RESPONSE_BYTES + 1);
+        let base_url = mock_server_once("HTTP/1.1 200 OK", huge_body);
+        let provider = OpenAiCompatibleProvider::new(base_url, "test-key", "test-model");
+
+        let err = provider
+            .complete("system", "say hello")
+            .expect_err("an oversized response should be rejected");
         assert!(matches!(err, ProviderError::UnexpectedResponse(_)));
     }
 
@@ -328,8 +472,26 @@ mod tests {
         let provider =
             AnthropicProvider::with_base_url(base_url, "test-key", "claude-3-5-haiku-20241022");
 
-        let reply = provider.complete("say hello").expect("should succeed");
+        let reply = provider
+            .complete("system", "say hello")
+            .expect("should succeed");
         assert_eq!(reply, "hello from claude");
+    }
+
+    #[test]
+    fn anthropic_joins_every_text_block_not_only_the_first() {
+        let base_url = mock_server_once(
+            "HTTP/1.1 200 OK",
+            r#"{"content":[{"type":"text","text":"first block"},{"type":"text","text":"second block"}]}"#
+                .to_string(),
+        );
+        let provider =
+            AnthropicProvider::with_base_url(base_url, "test-key", "claude-3-5-haiku-20241022");
+
+        let reply = provider
+            .complete("system", "say hello")
+            .expect("should succeed");
+        assert_eq!(reply, "first block\nsecond block");
     }
 
     #[test]
@@ -342,7 +504,9 @@ mod tests {
         let provider =
             AnthropicProvider::with_base_url(base_url, "test-key", "claude-3-5-haiku-20241022");
 
-        let err = provider.complete("say hello").expect_err("should fail");
+        let err = provider
+            .complete("system", "say hello")
+            .expect_err("should fail");
         match err {
             ProviderError::Api { status, message } => {
                 assert_eq!(status, 429);
@@ -350,5 +514,30 @@ mod tests {
             }
             other => panic!("expected ProviderError::Api, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn join_url_avoids_a_double_slash() {
+        assert_eq!(
+            join_url("https://example.com/v1/", "chat/completions"),
+            "https://example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            join_url("https://example.com/v1", "/chat/completions"),
+            "https://example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn truncate_for_display_leaves_short_text_unchanged() {
+        assert_eq!(truncate_for_display("short"), "short");
+    }
+
+    #[test]
+    fn truncate_for_display_shortens_long_text() {
+        let long = "a".repeat(MAX_QUOTED_BODY_CHARS + 50);
+        let truncated = truncate_for_display(&long);
+        assert!(truncated.len() < long.len());
+        assert!(truncated.ends_with("(truncated)"));
     }
 }

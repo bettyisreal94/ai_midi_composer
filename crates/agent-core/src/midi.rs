@@ -15,6 +15,23 @@ use midly::{
 /// The default resolution for new clips: ticks per quarter note.
 pub const DEFAULT_TICKS_PER_QUARTER: u16 = 960;
 
+/// A sanity limit on how many notes one clip may have. This is not a
+/// musical limit; it exists so a malformed or oversized AI reply, or
+/// MIDI file, cannot make this project allocate an unbounded amount of
+/// memory, or spend an unbounded amount of time scheduling notes.
+pub const MAX_NOTES: usize = 10_000;
+
+/// A sanity limit on how far into a clip, in ticks, a note may end. At
+/// the default resolution (960 ticks per quarter note) and a slow
+/// tempo (60 beats per minute), this is a little over 86 hours: far
+/// more than any legitimate clip needs, but small enough to reject a
+/// wildly out-of-range value from a malformed reply or file. Kept
+/// above `u28::MAX` (268,435,455, the largest gap the standard MIDI
+/// file format can encode between two events), so the two limits stay
+/// independent: a clip can fail this check, `to_smf_bytes`'s own
+/// encoding-time check, or both, depending on which value is wrong.
+pub const MAX_CLIP_TICKS: u32 = 300_000_000;
+
 /// One played note.
 ///
 /// `start` and `duration` are in ticks. A tick is a fraction of a
@@ -110,6 +127,10 @@ pub enum MidiError {
     /// of the same, simultaneous performance. Merging format 2's
     /// tracks the same way would wrongly play unrelated songs at once.
     UnsupportedFormat,
+    /// The clip has more notes than [`MAX_NOTES`].
+    TooManyNotes(usize),
+    /// A note ends further into the clip than [`MAX_CLIP_TICKS`].
+    ClipTooLong(u32),
 }
 
 impl fmt::Display for MidiError {
@@ -143,6 +164,15 @@ impl fmt::Display for MidiError {
                 write!(
                     f,
                     "this project cannot read format 2 (independent sequential tracks)"
+                )
+            }
+            MidiError::TooManyNotes(count) => {
+                write!(f, "the clip has {count} notes; the limit is {MAX_NOTES}")
+            }
+            MidiError::ClipTooLong(tick) => {
+                write!(
+                    f,
+                    "a note ends at tick {tick}; the limit is {MAX_CLIP_TICKS}"
                 )
             }
         }
@@ -247,6 +277,12 @@ impl MidiClip {
             return Err(MidiError::TempoOutOfRange);
         }
 
+        if self.time_signature.numerator == 0 {
+            return Err(MidiError::OutOfRange {
+                field: "time_signature.numerator",
+                value: 0,
+            });
+        }
         if self.time_signature.denominator == 0
             || !self.time_signature.denominator.is_power_of_two()
         {
@@ -254,6 +290,10 @@ impl MidiClip {
                 field: "time_signature.denominator",
                 value: self.time_signature.denominator as u32,
             });
+        }
+
+        if self.notes.len() > MAX_NOTES {
+            return Err(MidiError::TooManyNotes(self.notes.len()));
         }
 
         for note in &self.notes {
@@ -266,9 +306,13 @@ impl MidiClip {
             if note.duration == 0 {
                 return Err(MidiError::ZeroDuration);
             }
-            note.start
+            let end_tick = note
+                .start
                 .checked_add(note.duration)
                 .ok_or(MidiError::TickOverflow)?;
+            if end_tick > MAX_CLIP_TICKS {
+                return Err(MidiError::ClipTooLong(end_tick));
+            }
         }
 
         Ok(())
@@ -500,14 +544,77 @@ impl MidiClip {
             }
         }
 
+        normalize_overlaps(&mut notes);
         notes.sort_by_key(|note| (note.start, note.pitch, note.channel));
 
-        Ok(MidiClip {
+        let clip = MidiClip {
             ticks_per_quarter,
             tempo_bpm: tempo_bpm.unwrap_or(120.0),
             time_signature: time_signature.unwrap_or_default(),
             notes,
-        })
+        };
+
+        // A review found that an imported clip with retriggered notes
+        // could load and play successfully, then fail when the user
+        // tried to vary or save it, because `validate()` rejects the
+        // same-key overlaps `normalize_overlaps` is meant to remove.
+        // Checking here, instead of trusting that removal always
+        // works, means this function never hands back a clip that
+        // fails its own project's own rules.
+        clip.validate()?;
+        Ok(clip)
+    }
+}
+
+/// Shortens a note whose end overlaps the start of a later note with
+/// the same channel and pitch, so no two notes this function returns
+/// ever overlap that way. Drops a note that would be left with 0
+/// length by this, rather than leaving a still-overlapping 1-tick
+/// note behind.
+///
+/// A real-world MIDI file can retrigger a held note: two overlapping
+/// note-on events for the same key, with the note-off for the first
+/// one arriving after the second note-on. `from_smf_bytes`'s LIFO
+/// matching policy already recovers this as two separate notes (see
+/// its docs), but leaves them overlapping, which `MidiClip::validate`
+/// would reject.
+fn normalize_overlaps(notes: &mut Vec<Note>) {
+    let mut by_key: BTreeMap<(u8, u8), Vec<usize>> = BTreeMap::new();
+    for (index, note) in notes.iter().enumerate() {
+        by_key
+            .entry((note.channel, note.pitch))
+            .or_default()
+            .push(index);
+    }
+
+    let mut to_remove = Vec::new();
+    for indices in by_key.values() {
+        let mut indices = indices.clone();
+        indices.sort_by_key(|&index| notes[index].start);
+        for pair in indices.windows(2) {
+            let (first, second) = (pair[0], pair[1]);
+            let second_start = notes[second].start;
+            let first_start = notes[first].start;
+            let first_end = first_start.saturating_add(notes[first].duration);
+            if second_start < first_end {
+                let shortened = second_start.saturating_sub(first_start);
+                if shortened == 0 {
+                    // The two notes start at the same tick. Shortening
+                    // to 0 would just be dropped by `validate()` as a
+                    // zero-duration note anyway, and a length of 1
+                    // would still overlap `second`. Drop it instead.
+                    to_remove.push(first);
+                } else {
+                    notes[first].duration = shortened;
+                }
+            }
+        }
+    }
+
+    to_remove.sort_unstable();
+    to_remove.dedup();
+    for index in to_remove.into_iter().rev() {
+        notes.remove(index);
     }
 }
 
@@ -738,6 +845,56 @@ mod tests {
     }
 
     #[test]
+    fn zero_time_signature_numerator_is_rejected() {
+        let clip = MidiClip {
+            time_signature: TimeSignature {
+                numerator: 0,
+                denominator: 4,
+            },
+            ..MidiClip::default()
+        };
+        assert!(matches!(
+            clip.validate(),
+            Err(MidiError::OutOfRange {
+                field: "time_signature.numerator",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn too_many_notes_is_rejected() {
+        let notes = (0..=MAX_NOTES as u32)
+            .map(|i| note(60, 100, i, 1, 0))
+            .collect();
+        let clip = MidiClip {
+            notes,
+            ..MidiClip::default()
+        };
+        assert!(matches!(clip.validate(), Err(MidiError::TooManyNotes(_))));
+    }
+
+    #[test]
+    fn a_note_ending_past_the_clip_length_limit_is_rejected() {
+        let clip = MidiClip {
+            notes: vec![note(60, 100, MAX_CLIP_TICKS, 1, 0)],
+            ..MidiClip::default()
+        };
+        assert!(matches!(clip.validate(), Err(MidiError::ClipTooLong(_))));
+    }
+
+    #[test]
+    fn normalize_overlaps_drops_a_note_that_would_collapse_to_zero_length() {
+        // Two notes of the same pitch and channel, starting at the
+        // exact same tick. Shortening the first to end where the
+        // second starts would give it 0 length, which `validate()`
+        // would reject anyway, so it is dropped instead.
+        let mut notes = vec![note(60, 100, 0, 100, 0), note(60, 90, 0, 50, 0)];
+        normalize_overlaps(&mut notes);
+        assert_eq!(notes, vec![note(60, 90, 0, 50, 0)]);
+    }
+
+    #[test]
     fn malformed_bytes_do_not_panic() {
         let err = MidiClip::from_smf_bytes(b"not a midi file")
             .expect_err("garbage bytes should not parse");
@@ -790,7 +947,13 @@ mod tests {
         // still playing.
         // Event order: NoteOn A @0, NoteOn B @50, NoteOff @100, NoteOff @150.
         // LIFO matching pairs the first NoteOff with B (the most
-        // recently opened note), and the second NoteOff with A.
+        // recently opened note), and the second NoteOff with A, which
+        // would leave A spanning tick 0 to 150 and B spanning tick 50
+        // to 100: B nested entirely inside A. `normalize_overlaps`
+        // then shortens A so it ends where B starts, since
+        // `MidiClip::validate` would otherwise reject the overlap (see
+        // REVIEW.md: an import must never produce a clip that later
+        // fails to save or vary).
         let track: Track = vec![
             TrackEvent {
                 delta: u28::from(0),
@@ -842,8 +1005,11 @@ mod tests {
         let parsed = MidiClip::from_smf_bytes(&bytes).expect("bytes should decode");
         assert_eq!(
             parsed.notes,
-            vec![note(60, 100, 0, 150, 0), note(60, 90, 50, 50, 0)]
+            vec![note(60, 100, 0, 50, 0), note(60, 90, 50, 50, 0)]
         );
+        // The whole point of normalizing on import: the result must
+        // always be usable, not just loadable.
+        assert!(parsed.validate().is_ok());
     }
 
     #[test]

@@ -70,20 +70,6 @@ fn demo_clip() -> MidiClip {
     }
 }
 
-/// How long `clip` loops for, in ticks: the end of its last note. This
-/// is a plugin-level concept, not part of the general [`MidiClip`] data
-/// model, so it does not live in `agent-core`. A generated clip's
-/// length is not fixed the way the demo clip's was, so this is
-/// computed fresh from whatever clip is currently playing, not stored
-/// as a fixed constant.
-fn loop_length_ticks_for(clip: &MidiClip) -> u32 {
-    clip.notes
-        .iter()
-        .map(|note| note.start.saturating_add(note.duration))
-        .max()
-        .unwrap_or(clip.ticks_per_quarter as u32 * 4)
-}
-
 /// The editor's full state: the reusable UI state from `agent-ui`, plus
 /// the one piece of bookkeeping that only makes sense on the plugin
 /// side of the crate boundary: which background request, if any, is
@@ -110,9 +96,13 @@ struct AgentPlugin {
     /// clean up and resynchronize only when the clip itself changed.
     last_seen_generation: u64,
     /// The clip's current playback position, in ticks, wrapped to the
-    /// current clip's own length (see `loop_length_ticks_for`). The
-    /// audio thread owns this value.
+    /// current clip's own length. The audio thread owns this value.
     playhead_ticks: f64,
+    /// An index into the current `PlayableClip`'s event list: the next
+    /// event `process()` has not yet sent. Advances as playback moves
+    /// forward; relocated with binary search, not a scan, whenever the
+    /// playhead resynchronizes. See `scheduler::schedule_events`.
+    cursor: usize,
     /// Which notes the audio thread has sent a note-on for, with no
     /// note-off sent yet. Used to clean up on stop and on a detected
     /// transport discontinuity, so no note is left stuck on.
@@ -138,6 +128,7 @@ impl Default for AgentPlugin {
             clip_reader,
             last_seen_generation: 0,
             playhead_ticks: 0.0,
+            cursor: 0,
             active_notes: ActiveNotes::default(),
             expected_host_tick: None,
             sample_rate: 44_100.0,
@@ -321,6 +312,7 @@ impl Plugin for AgentPlugin {
         // as a full reinitialization; just clear this plugin's own
         // bookkeeping, so the next `process()` call starts clean.
         self.playhead_ticks = 0.0;
+        self.cursor = 0;
         self.active_notes = ActiveNotes::default();
         self.expected_host_tick = None;
     }
@@ -338,31 +330,48 @@ impl Plugin for AgentPlugin {
             }
         }
 
+        // Read every field this function needs from the transport up
+        // front, into plain, owned values. `context.transport()`
+        // borrows `context`; ending that borrow immediately, instead
+        // of holding `transport` alive across the function, is what
+        // lets the code below also borrow `context` mutably (through
+        // `emit_event`) to send events.
         let transport = context.transport();
+        let playing = transport.playing;
+        let tempo = transport.tempo;
+        let pos_beats = transport.pos_beats();
         let num_samples = buffer.samples();
 
-        if !transport.playing || num_samples == 0 {
+        if !playing || num_samples == 0 {
             // Stopping must not leave a note stuck on at the host.
             self.expected_host_tick = None;
-            emit_events(context, scheduler::stop_all_notes(&mut self.active_notes));
+            scheduler::stop_all_notes(&mut self.active_notes, &mut |event| {
+                emit_event(context, event)
+            });
             return ProcessStatus::Normal;
         }
 
         // `.read()` never allocates and never drops a value; see
         // `clip_publisher`. `published.generation` lets this tell a
         // genuine clip replacement (from a finished "Generate") apart
-        // from an ordinary transport update.
+        // from an ordinary transport update. `published.playable` is
+        // already a sorted, ready-to-walk event list: nothing here
+        // scans every note or sorts anything, unlike the version of
+        // this function a review found still allocating and sorting
+        // on the audio thread.
         let published = self.clip_reader.read();
-        let clip = &published.clip;
+        let playable = &published.playable;
         let clip_changed = published.generation != self.last_seen_generation;
         self.last_seen_generation = published.generation;
 
-        let loop_length_ticks = loop_length_ticks_for(clip);
-        let loop_len_ticks = loop_length_ticks as f64;
+        if playable.is_empty() {
+            return ProcessStatus::Normal;
+        }
+        let loop_len_ticks = playable.loop_length_ticks as f64;
 
-        let tempo_bpm = transport.tempo.unwrap_or(clip.tempo_bpm);
+        let tempo_bpm = tempo.unwrap_or(published.clip.tempo_bpm);
         let samples_per_tick = if tempo_bpm > 0.0 {
-            (60.0 / tempo_bpm) * self.sample_rate as f64 / clip.ticks_per_quarter as f64
+            (60.0 / tempo_bpm) * self.sample_rate as f64 / published.clip.ticks_per_quarter as f64
         } else {
             0.0
         };
@@ -383,8 +392,8 @@ impl Plugin for AgentPlugin {
         // playing.
         let mut needs_resync = clip_changed;
         let mut host_tick = None;
-        if let Some(beats) = transport.pos_beats() {
-            let tick = beats * clip.ticks_per_quarter as f64;
+        if let Some(beats) = pos_beats {
+            let tick = beats * published.clip.ticks_per_quarter as f64;
             let jumped = match self.expected_host_tick {
                 Some(expected) => (tick - expected).abs() > 0.5,
                 None => true, // the first block since playback started
@@ -400,64 +409,55 @@ impl Plugin for AgentPlugin {
             self.expected_host_tick = None;
         }
 
-        let cleanup_events = if needs_resync {
-            scheduler::stop_all_notes(&mut self.active_notes)
-        } else {
-            Vec::new()
-        };
         if needs_resync {
+            scheduler::stop_all_notes(&mut self.active_notes, &mut |event| {
+                emit_event(context, event)
+            });
             // Prefer the host's own position; fall back to the start
             // of the clip, rather than reusing a playhead position
             // that belonged to a different clip's timeline.
             self.playhead_ticks = host_tick.map_or(0.0, |tick| tick.rem_euclid(loop_len_ticks));
+            // The cursor must move with the playhead: relocated with
+            // binary search, not a scan, so a resync never costs more
+            // than a normal block.
+            self.cursor = playable.index_at_or_after(self.playhead_ticks);
         }
 
-        let (mut events, next_tick) = scheduler::schedule_clip_events(
-            clip,
-            loop_length_ticks,
+        let next_tick = scheduler::schedule_events(
+            playable,
+            &mut self.cursor,
             self.playhead_ticks,
             samples_per_tick,
             num_samples,
             &mut self.active_notes,
+            &mut |event| emit_event(context, event),
         );
         self.playhead_ticks = next_tick;
-
-        // Cleanup note-offs from a discontinuity or a clip change
-        // close out notes from before it, so they must play first.
-        let mut all_events = cleanup_events;
-        all_events.append(&mut events);
-        emit_events(context, all_events);
 
         ProcessStatus::Normal
     }
 }
 
-/// Sends `events` to the host, in order, converting each
-/// [`scheduler::ScheduledEvent`] into the `NoteEvent` type `nih_plug`
-/// expects.
-fn emit_events(
-    context: &mut impl ProcessContext<AgentPlugin>,
-    events: Vec<scheduler::ScheduledEvent>,
-) {
-    for event in events {
-        let note_event = match event.kind {
-            scheduler::ScheduledEventKind::NoteOn { velocity } => NoteEvent::NoteOn {
-                timing: event.timing,
-                voice_id: None,
-                channel: event.channel,
-                note: event.pitch,
-                velocity,
-            },
-            scheduler::ScheduledEventKind::NoteOff => NoteEvent::NoteOff {
-                timing: event.timing,
-                voice_id: None,
-                channel: event.channel,
-                note: event.pitch,
-                velocity: 0.0,
-            },
-        };
-        context.send_event(note_event);
-    }
+/// Converts one [`scheduler::ScheduledEvent`] into the `NoteEvent`
+/// type `nih_plug` expects, and sends it to the host.
+fn emit_event(context: &mut impl ProcessContext<AgentPlugin>, event: scheduler::ScheduledEvent) {
+    let note_event = match event.kind {
+        scheduler::ScheduledEventKind::NoteOn { velocity } => NoteEvent::NoteOn {
+            timing: event.timing,
+            voice_id: None,
+            channel: event.channel,
+            note: event.pitch,
+            velocity,
+        },
+        scheduler::ScheduledEventKind::NoteOff => NoteEvent::NoteOff {
+            timing: event.timing,
+            voice_id: None,
+            channel: event.channel,
+            note: event.pitch,
+            velocity: 0.0,
+        },
+    };
+    context.send_event(note_event);
 }
 
 /// Opens a native "save file" dialog, and writes `clip` to the chosen

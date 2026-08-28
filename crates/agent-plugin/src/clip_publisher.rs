@@ -22,16 +22,28 @@
 //! `agent-plugin`'s `process()` can tell when the clip actually
 //! changed (not just when the host's transport moved), and clean up
 //! and resynchronize accordingly.
+//!
+//! A review after Phase 6 pointed out that publishing the editable
+//! `MidiClip` alone was not enough: turning it into playback events
+//! still required scanning and sorting on the audio thread, on every
+//! `process()` call. This module now also converts the clip into a
+//! [`scheduler::PlayableClip`] at publish time, on the publisher's
+//! thread, and hands both to the audio thread together.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_core::midi::MidiClip;
 
-/// One published clip, tagged with a generation number.
+use crate::scheduler::PlayableClip;
+
+/// One published clip, tagged with a generation number, together with
+/// its notes already converted into a sorted, ready-to-play event
+/// list.
 #[derive(Clone)]
 pub struct PublishedClip {
     pub clip: MidiClip,
+    pub playable: PlayableClip,
     pub generation: u64,
 }
 
@@ -63,8 +75,10 @@ impl ClipPublisher {
     /// Builds a new publisher/reader pair, with `initial_clip` already
     /// published as generation 0.
     pub fn new(initial_clip: MidiClip) -> (Self, ClipReader) {
+        let playable = PlayableClip::from_clip(&initial_clip);
         let (input, output) = triple_buffer::TripleBuffer::new(&PublishedClip {
             clip: initial_clip,
+            playable,
             generation: 0,
         })
         .split();
@@ -78,13 +92,19 @@ impl ClipPublisher {
 
     /// Publishes `clip` as the new value for the audio thread to pick
     /// up. Call this from the editor or the background task executor,
-    /// never from the audio thread.
+    /// never from the audio thread: building the `PlayableClip`
+    /// allocates and sorts.
     pub fn publish(&self, clip: MidiClip) {
+        let playable = PlayableClip::from_clip(&clip);
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         self.input
             .lock()
             .expect("clip publisher mutex should not be poisoned")
-            .write(PublishedClip { clip, generation });
+            .write(PublishedClip {
+                clip,
+                playable,
+                generation,
+            });
     }
 }
 
