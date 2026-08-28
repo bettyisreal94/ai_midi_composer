@@ -117,6 +117,30 @@ fn build_client() -> reqwest::blocking::Client {
         .expect("building an HTTP client with the default TLS setup should not fail")
 }
 
+/// Describes a failed [`reqwest::blocking::Client::send`] call, walking
+/// its `source()` chain, not just its own `Display` text.
+///
+/// A maintainer found this necessary after seeing an unhelpful error
+/// like "error sending request for url (...)" while debugging a local
+/// Ollama connection: `reqwest::Error`'s own `Display` only describes
+/// the *kind* of failure (building the request, sending it, decoding
+/// the response, ...), not *why* it failed. The actual reason (for
+/// example "tcp connect error: Connection refused", or a DNS failure,
+/// or a timeout) lives one or more levels deeper, in
+/// `std::error::Error::source()`, which `Display` does not include by
+/// itself. Joining the whole chain gives the user something they can
+/// actually act on.
+fn describe_request_error(err: reqwest::Error) -> String {
+    let mut message = err.to_string();
+    let mut cause = std::error::Error::source(&err);
+    while let Some(source) = cause {
+        message.push_str(": ");
+        message.push_str(&source.to_string());
+        cause = source.source();
+    }
+    message
+}
+
 /// Joins `base` and `path` with exactly one slash between them,
 /// regardless of whether `base` already ends with one. Without this, a
 /// base URL with a trailing slash (a very easy mistake to paste in)
@@ -211,7 +235,7 @@ impl AiProvider for OpenAiCompatibleProvider {
                 ],
             }))
             .send()
-            .map_err(|err| ProviderError::Request(err.to_string()))?;
+            .map_err(|err| ProviderError::Request(describe_request_error(err)))?;
 
         let status = response.status();
         let body = read_body_bounded(response)?;
@@ -305,7 +329,7 @@ impl AiProvider for AnthropicProvider {
                 "messages": [{"role": "user", "content": user_prompt}],
             }))
             .send()
-            .map_err(|err| ProviderError::Request(err.to_string()))?;
+            .map_err(|err| ProviderError::Request(describe_request_error(err)))?;
 
         let status = response.status();
         let body = read_body_bounded(response)?;
@@ -449,6 +473,43 @@ mod tests {
             .complete("system", "say hello")
             .expect_err("null content should be reported, not panic");
         assert!(matches!(err, ProviderError::UnexpectedResponse(_)));
+    }
+
+    #[test]
+    fn connection_errors_include_the_real_cause_not_just_the_generic_wrapper() {
+        // Bind a listener to get a genuinely free local port, then drop
+        // it immediately, so nothing is actually listening there
+        // anymore. Connecting to a free port on localhost reliably
+        // fails with "connection refused", without depending on a real
+        // server being reachable (or unreachable) in whatever
+        // environment runs this test.
+        //
+        // Regression test for a real bug a maintainer hit while
+        // debugging a local Ollama connection: `reqwest::Error`'s own
+        // `Display` text only says "error sending request for url
+        // (...)", with no hint of *why*. The real reason lives in its
+        // `source()` chain instead.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("mock server should bind");
+        let addr = listener
+            .local_addr()
+            .expect("mock server should have an address");
+        drop(listener);
+
+        let provider =
+            OpenAiCompatibleProvider::new(format!("http://{addr}"), "test-key", "test-model");
+        let err = provider
+            .complete("system", "say hello")
+            .expect_err("nothing is listening on this port, so this must fail");
+        match err {
+            ProviderError::Request(message) => {
+                assert!(
+                    message.to_lowercase().contains("refused"),
+                    "expected the real connection failure reason (\"connection refused\"), \
+                     not just the generic wrapper text; got: {message}"
+                );
+            }
+            other => panic!("expected ProviderError::Request, got {other:?}"),
+        }
     }
 
     #[test]
