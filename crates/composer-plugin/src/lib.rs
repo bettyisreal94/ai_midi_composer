@@ -212,70 +212,70 @@ impl Plugin for ComposerPlugin {
             },
             |_, _| {},
             move |ctx, _setter, state| {
-                // Check for a finished background generation before
-                // drawing, so this frame already shows the result.
-                if let Some(id) = state.pending_request_id {
-                    if let Some(result) = generation_store.poll(id) {
-                        state.pending_request_id = None;
-                        match result {
-                            Ok(clip) => {
-                                state.ui.status_message =
-                                    format!("Generated {} notes.", clip.notes.len());
-                                // Send the new clip to the audio thread
-                                // for live playback, and show it in the
-                                // editor for saving. See
-                                // `clip_publisher` for why this is not
-                                // a plain assignment shared with the
-                                // audio thread.
-                                clip_publisher.publish(clip.clone());
-                                state.ui.clip = clip;
-                                state.ui.status = composer_ui::GenerationStatus::Done;
-                            }
-                            Err(message) => {
-                                state.ui.error_detail = Some(message.clone());
-                                state.ui.status_message = message;
-                                state.ui.status = composer_ui::GenerationStatus::Error;
+                // A maintainer hit a real crash pressing "Save as
+                // .mid...", and asked for this path to fail safely
+                // instead. A Rust panic that unwinds out of a callback
+                // the host calls into (this one, called every frame by
+                // `nih_plug_egui`) crosses back into the host's own
+                // C/C++ code as it unwinds, which is undefined
+                // behavior, and in practice usually aborts the whole
+                // host process, not just this plugin. Catching the
+                // panic here, at the outermost point in this callback,
+                // turns a real bug into a normal, visible error
+                // instead of a crash. This only catches genuine Rust
+                // panics (a bug in this project's own code, or in a
+                // dependency such as `rfd`'s native file-dialog
+                // binding); it cannot catch a native crash that never
+                // goes through Rust's own panic mechanism at all (for
+                // example a segfault, or an uncaught Objective-C
+                // exception on macOS).
+                let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Check for a finished background generation before
+                    // drawing, so this frame already shows the result.
+                    if let Some(id) = state.pending_request_id {
+                        if let Some(result) = generation_store.poll(id) {
+                            state.pending_request_id = None;
+                            match result {
+                                Ok(clip) => {
+                                    state.ui.status_message =
+                                        format!("Generated {} notes.", clip.notes.len());
+                                    // Send the new clip to the audio thread
+                                    // for live playback, and show it in the
+                                    // editor for saving. See
+                                    // `clip_publisher` for why this is not
+                                    // a plain assignment shared with the
+                                    // audio thread.
+                                    clip_publisher.publish(clip.clone());
+                                    state.ui.clip = clip;
+                                    state.ui.status = composer_ui::GenerationStatus::Done;
+                                }
+                                Err(message) => {
+                                    state.ui.error_detail = Some(message.clone());
+                                    state.ui.status_message = message;
+                                    state.ui.status = composer_ui::GenerationStatus::Error;
+                                }
                             }
                         }
                     }
-                }
 
-                let pending = state.pending_request_id.is_some();
-                let actions = composer_ui::draw(ctx, &mut state.ui, pending);
+                    let pending = state.pending_request_id.is_some();
+                    let actions = composer_ui::draw(ctx, &mut state.ui, pending);
 
-                for action in actions {
-                    match action {
-                        composer_ui::UiAction::Generate => {
-                            // Ignore extra clicks while a request is
-                            // already running. `composer_ui::draw` also
-                            // disables the button for this, so this
-                            // check only matters if a click was
-                            // already queued the instant before that
-                            // happened.
-                            if state.pending_request_id.is_none() {
-                                let config = ProviderConfig::from(&state.ui.settings);
-                                let id =
-                                    generation_store.submit(state.ui.prompt.clone(), config, None);
-                                state.pending_request_id = Some(id);
-                                state.ui.status = composer_ui::GenerationStatus::Working;
-                                state.ui.status_message.clear();
-                                async_executor.execute_background(GenerateTask(id));
-                            }
-                        }
-                        composer_ui::UiAction::GenerateVariation => {
-                            if state.pending_request_id.is_none() {
-                                if state.ui.prompt.trim().is_empty() {
-                                    state.ui.error_detail =
-                                        Some("Type an instruction first.".to_string());
-                                    state.ui.status_message =
-                                        "Type an instruction first.".to_string();
-                                    state.ui.status = composer_ui::GenerationStatus::Error;
-                                } else {
+                    for action in actions {
+                        match action {
+                            composer_ui::UiAction::Generate => {
+                                // Ignore extra clicks while a request is
+                                // already running. `composer_ui::draw` also
+                                // disables the button for this, so this
+                                // check only matters if a click was
+                                // already queued the instant before that
+                                // happened.
+                                if state.pending_request_id.is_none() {
                                     let config = ProviderConfig::from(&state.ui.settings);
                                     let id = generation_store.submit(
                                         state.ui.prompt.clone(),
                                         config,
-                                        Some(state.ui.clip.clone()),
+                                        None,
                                     );
                                     state.pending_request_id = Some(id);
                                     state.ui.status = composer_ui::GenerationStatus::Working;
@@ -283,95 +283,130 @@ impl Plugin for ComposerPlugin {
                                     async_executor.execute_background(GenerateTask(id));
                                 }
                             }
-                        }
-                        composer_ui::UiAction::LoadMidFile => match load_clip_from_file() {
-                            Ok(Some(clip)) => {
-                                state.ui.status_message =
-                                    format!("Loaded {} notes from file.", clip.notes.len());
-                                clip_publisher.publish(clip.clone());
-                                state.ui.clip = clip;
-                                state.ui.status = composer_ui::GenerationStatus::Done;
+                            composer_ui::UiAction::GenerateVariation => {
+                                if state.pending_request_id.is_none() {
+                                    if state.ui.prompt.trim().is_empty() {
+                                        state.ui.error_detail =
+                                            Some("Type an instruction first.".to_string());
+                                        state.ui.status_message =
+                                            "Type an instruction first.".to_string();
+                                        state.ui.status = composer_ui::GenerationStatus::Error;
+                                    } else {
+                                        let config = ProviderConfig::from(&state.ui.settings);
+                                        let id = generation_store.submit(
+                                            state.ui.prompt.clone(),
+                                            config,
+                                            Some(state.ui.clip.clone()),
+                                        );
+                                        state.pending_request_id = Some(id);
+                                        state.ui.status = composer_ui::GenerationStatus::Working;
+                                        state.ui.status_message.clear();
+                                        async_executor.execute_background(GenerateTask(id));
+                                    }
+                                }
                             }
-                            Ok(None) => {
-                                // The user cancelled the file picker.
-                            }
-                            Err(message) => {
-                                state.ui.error_detail = Some(message.clone());
-                                state.ui.status_message = message;
-                                state.ui.status = composer_ui::GenerationStatus::Error;
-                            }
-                        },
-                        composer_ui::UiAction::Save => {
-                            let result = save_clip_to_file(&state.ui.clip);
-                            if let Err(message) = &result {
-                                state.ui.error_detail = Some(message.clone());
-                            }
-                            state.ui.save_message = Some(result);
-                        }
-                        composer_ui::UiAction::ProviderKindChanged => {
-                            // Show whatever key is already saved for
-                            // the newly picked provider, instead of
-                            // leaving the previous provider's key
-                            // visible under the wrong provider. The
-                            // base URL must be updated first: the
-                            // keychain entry is keyed on (kind,
-                            // base_url), not on kind alone, so each
-                            // OpenAI-compatible service (OpenAI,
-                            // DeepSeek, OpenRouter, a local server, ...)
-                            // can keep its own separate key.
-                            let defaults =
-                                composer_ui::ProviderSettings::defaults_for(state.ui.settings.kind);
-                            state.ui.settings.base_url = defaults.base_url;
-                            state.ui.settings.model = defaults.model;
-                            state.ui.settings_message = match settings::load_api_key(
-                                state.ui.settings.kind,
-                                &state.ui.settings.base_url,
-                            ) {
-                                Ok(api_key) => {
-                                    state.ui.settings.api_key = api_key;
-                                    None
+                            composer_ui::UiAction::LoadMidFile => match load_clip_from_file() {
+                                Ok(Some(clip)) => {
+                                    state.ui.status_message =
+                                        format!("Loaded {} notes from file.", clip.notes.len());
+                                    clip_publisher.publish(clip.clone());
+                                    state.ui.clip = clip;
+                                    state.ui.status = composer_ui::GenerationStatus::Done;
+                                }
+                                Ok(None) => {
+                                    // The user cancelled the file picker.
                                 }
                                 Err(message) => {
-                                    state.ui.settings.api_key = String::new();
-                                    let full_message =
-                                        format!("could not read the saved API key: {message}");
-                                    state.ui.error_detail = Some(full_message.clone());
-                                    Some(Err(full_message))
+                                    state.ui.error_detail = Some(message.clone());
+                                    state.ui.status_message = message;
+                                    state.ui.status = composer_ui::GenerationStatus::Error;
                                 }
-                            };
-                        }
-                        composer_ui::UiAction::SaveApiKey => {
-                            let key_result = settings::save_api_key(
-                                state.ui.settings.kind,
-                                &state.ui.settings.base_url,
-                                &state.ui.settings.api_key,
-                            );
-                            // Also persist the non-secret settings
-                            // (kind, base URL, model) alongside the key,
-                            // so they survive a plugin restart too. Best
-                            // effort: a failure here should not hide
-                            // that the API key itself did save.
-                            if key_result.is_ok() {
-                                let _ = settings::save_persisted_settings(&state.ui.settings);
+                            },
+                            composer_ui::UiAction::Save => {
+                                let result = save_clip_to_file(&state.ui.clip);
+                                if let Err(message) = &result {
+                                    state.ui.error_detail = Some(message.clone());
+                                }
+                                state.ui.save_message = Some(result);
                             }
-                            if let Err(message) = &key_result {
-                                state.ui.error_detail = Some(message.clone());
+                            composer_ui::UiAction::ProviderKindChanged => {
+                                // Show whatever key is already saved for
+                                // the newly picked provider, instead of
+                                // leaving the previous provider's key
+                                // visible under the wrong provider. The
+                                // base URL must be updated first: the
+                                // keychain entry is keyed on (kind,
+                                // base_url), not on kind alone, so each
+                                // OpenAI-compatible service (OpenAI,
+                                // DeepSeek, OpenRouter, a local server, ...)
+                                // can keep its own separate key.
+                                let defaults = composer_ui::ProviderSettings::defaults_for(
+                                    state.ui.settings.kind,
+                                );
+                                state.ui.settings.base_url = defaults.base_url;
+                                state.ui.settings.model = defaults.model;
+                                state.ui.settings_message = match settings::load_api_key(
+                                    state.ui.settings.kind,
+                                    &state.ui.settings.base_url,
+                                ) {
+                                    Ok(api_key) => {
+                                        state.ui.settings.api_key = api_key;
+                                        None
+                                    }
+                                    Err(message) => {
+                                        state.ui.settings.api_key = String::new();
+                                        let full_message =
+                                            format!("could not read the saved API key: {message}");
+                                        state.ui.error_detail = Some(full_message.clone());
+                                        Some(Err(full_message))
+                                    }
+                                };
                             }
-                            state.ui.settings_message = Some(key_result);
-                        }
-                        composer_ui::UiAction::CopyErrorToClipboard => {
-                            // `composer-ui` has no OS dependency (see
-                            // its module docs), so it only reports that
-                            // the button was pressed; this is the one
-                            // place that actually reaches the OS
-                            // clipboard, through `arboard`, which talks
-                            // to the OS directly and does not depend on
-                            // `nih_plug_egui`'s own windowing backend
-                            // having clipboard support.
-                            let text = state.ui.error_detail.clone().unwrap_or_default();
-                            state.ui.clipboard_message = Some(copy_to_clipboard(&text));
+                            composer_ui::UiAction::SaveApiKey => {
+                                let key_result = settings::save_api_key(
+                                    state.ui.settings.kind,
+                                    &state.ui.settings.base_url,
+                                    &state.ui.settings.api_key,
+                                );
+                                // Also persist the non-secret settings
+                                // (kind, base URL, model) alongside the key,
+                                // so they survive a plugin restart too. Best
+                                // effort: a failure here should not hide
+                                // that the API key itself did save.
+                                if key_result.is_ok() {
+                                    let _ = settings::save_persisted_settings(&state.ui.settings);
+                                }
+                                if let Err(message) = &key_result {
+                                    state.ui.error_detail = Some(message.clone());
+                                }
+                                state.ui.settings_message = Some(key_result);
+                            }
+                            composer_ui::UiAction::CopyErrorToClipboard => {
+                                // `composer-ui` has no OS dependency (see
+                                // its module docs), so it only reports that
+                                // the button was pressed; this is the one
+                                // place that actually reaches the OS
+                                // clipboard, through `arboard`, which talks
+                                // to the OS directly and does not depend on
+                                // `nih_plug_egui`'s own windowing backend
+                                // having clipboard support.
+                                let text = state.ui.error_detail.clone().unwrap_or_default();
+                                state.ui.clipboard_message = Some(copy_to_clipboard(&text));
+                            }
                         }
                     }
+                }));
+
+                if let Err(panic_payload) = panic_result {
+                    let message = format!(
+                        "An internal error happened and was caught before it could crash the \
+                         host: {}",
+                        describe_panic_payload(&panic_payload)
+                    );
+                    state.pending_request_id = None;
+                    state.ui.error_detail = Some(message.clone());
+                    state.ui.status_message = message;
+                    state.ui.status = composer_ui::GenerationStatus::Error;
                 }
             },
         )
@@ -539,6 +574,24 @@ fn emit_event(context: &mut impl ProcessContext<ComposerPlugin>, event: schedule
         },
     };
     context.send_event(note_event);
+}
+
+/// Turns a caught panic's payload (from `std::panic::catch_unwind`)
+/// into readable text. A panic payload is `Box<dyn Any + Send>`; in
+/// practice it is almost always the message passed to `panic!()`, as
+/// either a `&'static str` (a plain `panic!("literal")`) or a `String`
+/// (anything built with `format!()`, including what `.expect()` and a
+/// failed `assert!()` produce), so those two cases cover what a user
+/// will actually see. Anything else falls back to a fixed message,
+/// rather than failing to report the panic at all.
+fn describe_panic_payload(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message.to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "no further details are available for this panic".to_string()
+    }
 }
 
 /// Writes `text` to the OS clipboard, using `arboard`, which talks to
